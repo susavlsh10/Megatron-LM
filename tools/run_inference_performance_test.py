@@ -55,12 +55,6 @@ def add_text_generate_args(parser):
         help='Return the log probabilities of the final output tokens',
     )
     group.add_argument(
-        "--top-n-logprobs",
-        type=int,
-        default=0,
-        help="Top-N logprobs"
-    )
-    group.add_argument(
         "--num-tokens-to-generate",
         type=int,
         default=30,
@@ -76,6 +70,13 @@ def add_text_generate_args(parser):
     )
     group.add_argument(
         "--num-input-tokens", type=int, default=None, help='Number of input tokens per prompt'
+    )
+    group.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=8,
+        dest="inference_max_requests",
+        help='Max number of prompts to process at once',
     )
     group.add_argument("--stream", action="store_true", default=False, help="Stream output tokens")
     group.add_argument(
@@ -110,7 +111,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         fp32_residual_connection=args.fp32_residual_connection,
         params_dtype=args.params_dtype,
         padded_vocab_size=args.padded_vocab_size,
-        inference_max_requests=args.inference_max_batch_size,
+        inference_max_requests=args.inference_max_requests,
         inference_max_seq_length=args.inference_max_seq_length,
         nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill
     )
@@ -258,7 +259,8 @@ def generate_dynamic(
 
     while inference_engine.has_unfinished_requests():
         result, _ = inference_engine.step(sampling_params, verbose=False)
-        if result is not None:
+        # if result is not None:
+        if result and result[0] is not None: # More robust check
             request_ids, finished_request_ids, sample = result
 
             request_ids = request_ids.tolist()
@@ -298,7 +300,7 @@ def main():
             'no_load_rng': True,
             'no_load_optim': True,
             'micro_batch_size': 1,
-            'exit_on_missing_checkpoint': True,
+            'exit_on_missing_checkpoint': False, #True,
         },
     )
 
@@ -312,9 +314,14 @@ def main():
 
     model = get_model(model_provider, wrap_with_ddp=False)
     tokenizer = get_tokenizer()
-    load_checkpoint(model, None, None)
+    # load_checkpoint(model, None, None)
     model = model[0]
     model.eval()
+
+    # print model on rank 0 only
+    rank0 = torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+    if rank0:
+        print(f"Model: {model}")
 
     assert (args.prompts is None) ^ (
         args.num_input_tokens is None
@@ -327,14 +334,13 @@ def main():
         top_k=args.top_k,
         top_p=args.top_p,
         return_log_probs=args.return_log_probs,
-        top_n_logprobs=args.top_n_logprobs,
         num_tokens_to_generate=args.num_tokens_to_generate,
     )
 
     requests = []
     if args.num_input_tokens is not None:
         assert args.prompts is None
-        batch_size = args.inference_max_batch_size
+        batch_size = args.inference_max_requests
         for i in range(batch_size):
             prompt_tokens = get_random_prompt_tokens(tokenizer, args.num_input_tokens)
             requests.append(
@@ -358,7 +364,8 @@ def main():
             )
 
     if args.enable_cuda_graph:
-        print(f"Running warmup for CUDA graphs...")
+        if rank0:
+            print(f"Running warmup for CUDA graphs...")
         if args.engine_type == "static":
             inference_engine.generate(
                 prompts=None, inference_requests=requests, sampling_params=sampling_params
@@ -366,9 +373,22 @@ def main():
         elif args.engine_type == "dynamic":
             generate_dynamic(args, requests, inference_engine, sampling_params)
 
+    # warm up inference engine
+    else: 
+        if rank0:
+            print(f"Warming up inference engine...")
+        if args.engine_type == "static":
+            inference_engine.generate(
+                prompts=args.prompts, inference_requests=requests, sampling_params=sampling_params
+            )
+        elif args.engine_type == "dynamic":
+            generate_dynamic(args, requests, inference_engine, sampling_params)
+
     if args.benchmark_profile:
         torch.cuda.cudart().cudaProfilerStart()
 
+    if rank0:
+        print(f"Starting inference...")
     start_time = time.perf_counter()
     if args.stream:
         if args.engine_type == "dynamic":
@@ -395,20 +415,57 @@ def main():
     if args.benchmark_profile:
         torch.cuda.cudart().cudaProfilerStop()
 
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        for idx, result in enumerate(results):
-            print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
-            generated_log_probs = result.generated_log_probs
-            result_dict = {
-                'id': result.request_id,
-                'num_input_tokens': len(result.prompt_tokens),
-                'num_output_tokens': len(result.generated_tokens),
-                'latency': latency,
+    if rank0:
+        # Determine batch size
+        if args.num_input_tokens is not None:
+            batch_size = args.inference_max_requests
+        else:
+            batch_size = len(args.prompts) if args.prompts is not None else 1
+        
+        # Only print individual prompt results if args.num_input_tokens is None AND args.prompts is not None
+        if args.num_input_tokens is None and args.prompts is not None:
+            for idx, result in enumerate(results):
+                print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
+                generated_log_probs = result.generated_log_probs
+                result_dict = {
+                    'id': result.request_id,
+                    'num_input_tokens': len(result.prompt_tokens),
+                    'num_output_tokens': len(result.generated_tokens),
+                    'latency': latency,
+                    'memory_usage_GB': memory_allocated / (1024**3),
+                }
+                if args.prompts is not None:
+                    result_dict['generated_output'] = tokenizer.detokenize(result.generated_tokens)
+                print(result_dict)
+        
+        # Calculate and print system throughput if batch size > 1
+        if batch_size > 1:
+            # Calculate total tokens processed
+            total_input_tokens = sum(len(result.prompt_tokens) for result in results)
+            total_output_tokens = sum(len(result.generated_tokens) for result in results)
+            total_tokens = total_input_tokens + total_output_tokens
+            
+            system_throughput_tokens_per_second = total_output_tokens / latency
+            system_throughput_requests_per_second = batch_size / latency
+            
+            print(f'\n------------- SYSTEM THROUGHPUT METRICS ---------------')
+            throughput_dict = {
+                'batch_size': batch_size,
+                'total_latency': latency,
+                'num_input_tokens_per_batch': total_input_tokens / batch_size,
+                'num_output_tokens_per_batch': total_output_tokens / batch_size,
+                'num_input_tokens': total_input_tokens,
+                'num_output_tokens': total_output_tokens,
+                'total_tokens': total_tokens,
+                'system_throughput_tokens_per_second': system_throughput_tokens_per_second,
+                'system_throughput_requests_per_second': system_throughput_requests_per_second,
                 'memory_usage_GB': memory_allocated / (1024**3),
             }
-            if args.prompts is not None:
-                result_dict['generated_output'] = tokenizer.detokenize(result.generated_tokens)
-            print(result_dict)
+            print(throughput_dict)
+
+    # destroy process groups if initialized
+    # if torch.distributed.is_initialized():
+    #     torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
