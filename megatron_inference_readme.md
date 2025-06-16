@@ -50,9 +50,10 @@ curl 'http://10.230.196.111:5000/api' -X 'PUT' -H 'Content-Type: application/jso
 
 Run performance script
 
-# required for tensor parallel inference 
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+required for tensor parallel inference 
 
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+```bash
 torchrun --nproc_per_node 1 --nnodes 1 tools/run_inference_performance_test.py \
     --use-checkpoint-args --use-flash-attn \
     --disable-bias-linear --tokenizer-type HuggingFaceTokenizer \
@@ -81,16 +82,19 @@ torchrun --nproc_per_node 1 --nnodes 1 tools/run_inference_performance_test.py \
     --prompts "The tallest mountain in the world is " \
     --enable-cuda-graph \
     --engine-type dynamic \
-
+```
 ## General model inference with no checkpoint for experiments
 
 
-# Llama-3-8b 
+## Llama-3-8b 
 
+```bash
 torchrun --nproc_per_node 4 --nnodes 1 tools/run_inference_performance_test.py     --use-flash-attn     --disable-bias-linear --tokenizer-type HuggingFaceTokenizer     --tokenizer-model meta-llama/Meta-Llama-3-8B      --transformer-impl transformer_engine --te-rng-tracker     --normalization RMSNorm     --group-query-attention --num-query-groups 8     --attention-dropout 0.0 --hidden-dropout 0.0     --untie-embeddings-and-output-weights     --position-embedding-type rope     --rotary-percent 1.0 --rotary-base 500000     --use-rotary-position-embeddings     --swiglu     --tensor-model-parallel-size 1      --pipeline-model-parallel-size 4      --num-layers 32      --hidden-size 4096      --ffn-hidden-size 14336     --num-attention-heads 32      --max-position-embeddings 8192      --fp16      --micro-batch-size 1      --num-tokens-to-generate 100     --seq-length 8192     --inference-max-requests 256     --max-batch-size 256     --num-input-tokens 1024 --benchmark-profile      --enable-cuda-graph 
+```
 
-# Llama-3-70b
 
+## Llama-3-70b
+```bash
 torchrun --nproc_per_node 2 --nnodes 1 tools/run_inference_performance_test.py \
     --tensor-model-parallel-size 2  \
     --pipeline-model-parallel-size 1  \
@@ -119,9 +123,11 @@ torchrun --nproc_per_node 2 --nnodes 1 tools/run_inference_performance_test.py \
     --max-batch-size 8 \
     --num-input-tokens 1024 --benchmark-profile \
     --enable-cuda-graph 
+```
 
-# Llama 4 scout
+## Llama 4 scout
 
+```bash
 torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
     --tensor-model-parallel-size 4  \
     --pipeline-model-parallel-size 2  \
@@ -176,10 +182,11 @@ torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
     --num-input-tokens 1024 --benchmark-profile \
     --transformer-impl transformer_engine --te-rng-tracker \
     --enable-cuda-graph 
-    
+```
 
 # Grok inference
 
+```bash
 torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
     --tensor-model-parallel-size 8  \
     --pipeline-model-parallel-size 1  \
@@ -233,3 +240,4 @@ torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
     --num-input-tokens 1024 --benchmark-profile \
     --transformer-impl transformer_engine --te-rng-tracker \
     --enable-cuda-graph 
+```
