@@ -31,6 +31,8 @@ _DATA_PARALLEL_GROUP_GLOO = None
 # tensor model parallel group and data parallel group combined
 # used for fp8 and moe training
 _TENSOR_AND_DATA_PARALLEL_GROUP = None
+# Attention data parallel group that the current rank belongs to.
+_ATTN_DATA_PARALLEL_GROUP = None
 
 ### Expert-related parallel states
 # Naming convention:
@@ -480,6 +482,7 @@ def initialize_model_parallel(
     expert_model_parallel_size: int = 1,
     num_distributed_optimizer_instances: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
+    attention_data_parallel_size: int = 1,
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     order: str = "tp-cp-ep-dp-pp",
@@ -573,6 +576,10 @@ def initialize_model_parallel(
 
         expert_tensor_parallel_size (int, default = tp_size):
             The number of GPUs to split individual tensors of expert.
+
+        attention_data_parallel_size (int, default = 1):
+            The number of data parallel GPUs in each attention data
+            parallel group.
 
         nccl_communicator_config_path (str, default = None):
             Path to the yaml file of NCCL communicator configurations.
@@ -766,6 +773,17 @@ def initialize_model_parallel(
         rank_offset=encoder_world_size,
     )
 
+    # Build attention rank generator
+    attention_rank_generator = RankGenerator(
+        tp=tensor_model_parallel_size,
+        ep=1,
+        dp=attention_data_parallel_size,
+        pp=pipeline_model_parallel_size,
+        cp=1,
+        order=order,
+        rank_offset=encoder_world_size,
+    )
+
     assert (
         order.endswith("pp")
         or pipeline_model_parallel_size == 1
@@ -948,6 +966,20 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
+
+    # Build the attention data-parallel groups.
+    global _ATTN_DATA_PARALLEL_GROUP
+    assert _ATTN_DATA_PARALLEL_GROUP is None, 'Attention data group is already initialized'
+    assert attention_data_parallel_size > 0, 'attention_data_parallel_size must be > 0'
+    for ranks in attention_rank_generator.get_ranks('dp'):
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options('attn_dp', nccl_comm_cfgs),
+            group_desc='ATTN_DATA_PARALLEL_GROUP',
+        )
+        if rank in ranks:
+            _ATTN_DATA_PARALLEL_GROUP = group
 
     # Build the context-parallel groups.
     global _CONTEXT_PARALLEL_GROUP
@@ -2070,6 +2102,29 @@ def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
         return 0
 
 
+def get_attention_data_parallel_group(check_initialized=True):
+    """Get attention data parallel group."""
+    if check_initialized:
+        assert _ATTN_DATA_PARALLEL_GROUP is not None, 'Attention data parallel group is not initialized'
+    return _ATTN_DATA_PARALLEL_GROUP
+
+
+def get_attention_data_parallel_rank():
+    """Return caller's rank in the attention data parallel group."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return get_attention_data_parallel_group().rank()
+    else:
+        return 0
+
+
+def get_attention_data_parallel_world_size():
+    """Return world size for the attention data parallel group."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return get_attention_data_parallel_group().size()
+    else:
+        return 0
+
+
 def get_intra_distributed_optimizer_instance_group():
     """Get the group of all GPUs in a distributed optimizer instance."""
     assert (
@@ -2162,6 +2217,9 @@ def destroy_model_parallel():
 
     global _TENSOR_AND_DATA_PARALLEL_GROUP
     _TENSOR_AND_DATA_PARALLEL_GROUP = None
+
+    global _ATTN_DATA_PARALLEL_GROUP
+    _ATTN_DATA_PARALLEL_GROUP = None
 
     global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
