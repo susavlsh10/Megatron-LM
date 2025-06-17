@@ -53,7 +53,11 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
         torch.distributed.init_process_group(world_size=world_size, rank=rank)
 
         # Megatron core distributed training initialization
-        parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            attention_data_parallel_size=1,
+        )
     ```
     <br>
 
