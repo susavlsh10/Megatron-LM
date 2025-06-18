@@ -125,65 +125,6 @@ torchrun --nproc_per_node 2 --nnodes 1 tools/run_inference_performance_test.py \
     --enable-cuda-graph 
 ```
 
-## Llama 4 scout
-
-```bash
-torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
-    --tensor-model-parallel-size 4  \
-    --pipeline-model-parallel-size 2  \
-    --use-flash-attn \
-    --flash-decode \
-    --tokenizer-model meta-llama/Llama-4-Scout-17B-16E-Instruct \
-    --micro-batch-size 1 \
-    --bf16 \
-    --no-masked-softmax-fusion \
-    --disable-bias-linear \
-    --untie-embeddings-and-output-weights \
-    --position-embedding-type rope \
-    --no-rope-fusion \
-    --normalization RMSNorm \
-    --swiglu \
-    --num-layers 48 \
-    --hidden-size 5120 \
-    --ffn-hidden-size 16384 \
-    --num-attention-heads 40 \
-    --group-query-attention \
-    --num-query-groups 8 \
-    --qk-layernorm \
-    --num-experts 16 \
-    --moe-ffn-hidden-size 8192 \
-    --moe-router-score-function sigmoid \
-    --moe-router-topk 1 \
-    --moe-router-topk-scaling-factor 1.0 \
-    --moe-shared-expert-intermediate-size 8192 \
-    --moe-aux-loss-coeff 1e-3 \
-    --moe-token-dispatcher-type alltoall \
-    --moe-token-drop-policy probs \
-    --moe-router-load-balancing-type seq_aux_loss \
-    --moe-expert-capacity-factor 1.25 \
-    --moe-pad-expert-input-to-capacity \
-    --seq-length 4096 \
-    --max-position-embeddings 4096 \
-    --tokenizer-type HuggingFaceTokenizer \
-    --make-vocab-size-divisible-by 128 \
-    --use-mcore-models \
-    --rotary-interleaved \
-    --rotary-percent 1.0 \
-    --rotary-base 500000 \
-    --rope-scaling-factor 8.0 \
-    --use-rope-scaling \
-    --no-bias-swiglu-fusion \
-    --qk-l2-norm \
-    --moe-apply-probs-on-input \
-    --moe-router-dtype fp64 \
-    --num-tokens-to-generate 100 \
-    --inference-max-requests 8 \
-    --max-batch-size 8 \
-    --num-input-tokens 1024 --benchmark-profile \
-    --transformer-impl transformer_engine --te-rng-tracker \
-    --enable-cuda-graph 
-```
-
 # Grok inference
 
 ```bash
@@ -239,5 +180,143 @@ torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
     --max-batch-size 8 \
     --num-input-tokens 1024 --benchmark-profile \
     --transformer-impl transformer_engine --te-rng-tracker \
+    --moe-grouped-gemm                              \
     --enable-cuda-graph 
+```
+
+## Llama 4 scout
+
+```bash
+torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
+    --tensor-model-parallel-size 4  \
+    --pipeline-model-parallel-size 2  \
+    --expert-model-parallel-size 4  \
+    --expert-tensor-parallel-size 1 \
+    --sequence-parallel \
+    --use-flash-attn \
+    --flash-decode \
+    --tokenizer-model meta-llama/Llama-4-Scout-17B-16E-Instruct \
+    --micro-batch-size 1 \
+    --bf16 \
+    --no-masked-softmax-fusion \
+    --disable-bias-linear \
+    --untie-embeddings-and-output-weights \
+    --position-embedding-type rope \
+    --no-rope-fusion \
+    --normalization RMSNorm \
+    --swiglu \
+    --num-layers 48 \
+    --hidden-size 5120 \
+    --ffn-hidden-size 16384 \
+    --num-attention-heads 40 \
+    --group-query-attention \
+    --num-query-groups 8 \
+    --qk-layernorm \
+    --num-experts 16 \
+    --moe-ffn-hidden-size 8192 \
+    --moe-router-score-function sigmoid \
+    --moe-router-topk 1 \
+    --moe-router-topk-scaling-factor 1.0 \
+    --moe-shared-expert-intermediate-size 8192 \
+    --moe-aux-loss-coeff 1e-3 \
+    --moe-token-dispatcher-type alltoall \
+    --moe-token-drop-policy probs \
+    --moe-router-load-balancing-type seq_aux_loss \
+    --moe-expert-capacity-factor 1.25 \
+    --moe-pad-expert-input-to-capacity \
+    --seq-length 4096 \
+    --max-position-embeddings 4096 \
+    --tokenizer-type HuggingFaceTokenizer \
+    --make-vocab-size-divisible-by 128 \
+    --use-mcore-models \
+    --rotary-interleaved \
+    --rotary-percent 1.0 \
+    --rotary-base 500000 \
+    --rope-scaling-factor 8.0 \
+    --use-rope-scaling \
+    --no-bias-swiglu-fusion \
+    --qk-l2-norm \
+    --moe-apply-probs-on-input \
+    --moe-router-dtype fp64 \
+    --num-tokens-to-generate 100 \
+    --inference-max-requests 8 \
+    --max-batch-size 8 \
+    --num-input-tokens 1024 --benchmark-profile \
+    --transformer-impl transformer_engine --te-rng-tracker \
+    --moe-grouped-gemm   \
+    --enable-cuda-graph 
+```
+
+
+
+
+# DeepSeekv3 
+
+```bash
+torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
+    --tensor-model-parallel-size 1  \
+    --pipeline-model-parallel-size 4  \
+    --expert-model-parallel-size 2  \
+    --expert-tensor-parallel-size 1 \
+    --use-flash-attn \
+    --flash-decode \
+    --tokenizer-model deepseek-ai/DeepSeek-V3 \
+    --micro-batch-size 1 \
+    --bf16 \
+    --no-masked-softmax-fusion \
+    --disable-bias-linear \
+    --untie-embeddings-and-output-weights \
+    --position-embedding-type rope \
+    --no-rope-fusion \
+    --normalization RMSNorm \
+    --swiglu \
+    --num-layers 16 \
+    --hidden-size 7168 \
+    --ffn-hidden-size 18432 \
+    --num-attention-heads 128 \
+    --num-experts 128 \
+    --moe-ffn-hidden-size 2048                \
+    --moe-shared-expert-intermediate-size 2048      \
+    --moe-router-load-balancing-type seq_aux_loss   \
+    --moe-router-topk 8            \
+    --moe-router-pre-softmax                        \
+    --moe-grouped-gemm                              \
+    --moe-aux-loss-coeff 1e-4                       \
+    --moe-router-group-topk 1  \
+    --moe-router-num-groups 1  \
+    --moe-router-topk-scaling-factor 2.5            \
+    --moe-router-score-function sigmoid             \
+    --moe-router-enable-expert-bias                 \
+    --moe-router-bias-update-rate 1e-3              \
+    --moe-router-dtype fp32                         \
+    --moe-permute-fusion                            \
+    --moe-token-dispatcher-type flex                \
+    --moe-enable-deepep                             \
+    --seq-length 8192 \
+    --max-position-embeddings 8192 \
+    --tokenizer-type HuggingFaceTokenizer \
+    --make-vocab-size-divisible-by 128 \
+    --use-mcore-models \
+    --rotary-percent 1.0 \
+    --rotary-base 500000 \
+    --rope-scaling-factor 8.0 \
+    --use-rope-scaling \
+    --no-bias-swiglu-fusion \
+    --num-tokens-to-generate 100 \
+    --inference-max-requests 8 \
+    --max-batch-size 8 \
+    --num-input-tokens 1024 --benchmark-profile \
+    --transformer-impl transformer_engine --te-rng-tracker \
+    --multi-latent-attention                \
+    --kv-channels 128    \
+    --q-lora-rank 1536 \
+    --kv-lora-rank 512 \
+    --qk-head-dim 128 \
+    --qk-pos-emb-head-dim 64 \
+    --v-head-dim 128 \
+    --rotary-scaling-factor 40 \
+    --mscale 1.0      \
+    --no-rope-fusion  \
+    --mscale-all-dim 1.0 
+    --enable-cuda-graph \
 ```
