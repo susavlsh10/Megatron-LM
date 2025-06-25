@@ -1,3 +1,5 @@
+# torchrun  --nnodes=2 --nproc_per_node=1 tensor_send_recv.py --batch_size 128 --hidden_dim 8192 --warmup_iters 10 --timing_iters 10 --verify_data
+
 import os
 import time
 import argparse

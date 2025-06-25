@@ -53,6 +53,7 @@ Run performance script
 required for tensor parallel inference 
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 ```bash
 torchrun --nproc_per_node 1 --nnodes 1 tools/run_inference_performance_test.py \
     --use-checkpoint-args --use-flash-attn \
@@ -188,9 +189,9 @@ torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
 
 ```bash
 torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
-    --tensor-model-parallel-size 4  \
-    --pipeline-model-parallel-size 2  \
-    --expert-model-parallel-size 4  \
+    --tensor-model-parallel-size 1  \
+    --pipeline-model-parallel-size 1  \
+    --expert-model-parallel-size 8  \
     --expert-tensor-parallel-size 1 \
     --sequence-parallel \
     --use-flash-attn \
@@ -205,7 +206,7 @@ torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
     --no-rope-fusion \
     --normalization RMSNorm \
     --swiglu \
-    --num-layers 48 \
+    --num-layers 16 \
     --hidden-size 5120 \
     --ffn-hidden-size 16384 \
     --num-attention-heads 40 \
@@ -239,8 +240,8 @@ torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
     --moe-apply-probs-on-input \
     --moe-router-dtype fp64 \
     --num-tokens-to-generate 100 \
-    --inference-max-requests 8 \
-    --max-batch-size 8 \
+    --inference-max-requests 2 \
+    --max-batch-size 2 \
     --num-input-tokens 1024 --benchmark-profile \
     --transformer-impl transformer_engine --te-rng-tracker \
     --moe-grouped-gemm   \
@@ -254,10 +255,10 @@ torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
 
 ```bash
 torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
-    --tensor-model-parallel-size 1  \
-    --pipeline-model-parallel-size 4  \
-    --expert-model-parallel-size 2  \
-    --expert-tensor-parallel-size 1 \
+    --tensor-model-parallel-size 8  \
+    --pipeline-model-parallel-size 1  \
+    --expert-model-parallel-size 1  \
+    --sequence-parallel             \
     --use-flash-attn \
     --flash-decode \
     --tokenizer-model deepseek-ai/DeepSeek-V3 \
@@ -270,7 +271,7 @@ torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
     --no-rope-fusion \
     --normalization RMSNorm \
     --swiglu \
-    --num-layers 16 \
+    --num-layers 1 \
     --hidden-size 7168 \
     --ffn-hidden-size 18432 \
     --num-attention-heads 128 \
@@ -290,8 +291,6 @@ torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
     --moe-router-bias-update-rate 1e-3              \
     --moe-router-dtype fp32                         \
     --moe-permute-fusion                            \
-    --moe-token-dispatcher-type flex                \
-    --moe-enable-deepep                             \
     --seq-length 8192 \
     --max-position-embeddings 8192 \
     --tokenizer-type HuggingFaceTokenizer \
@@ -317,6 +316,14 @@ torchrun --nproc_per_node 8 --nnodes 1 tools/run_inference_performance_test.py \
     --rotary-scaling-factor 40 \
     --mscale 1.0      \
     --no-rope-fusion  \
-    --mscale-all-dim 1.0 
+    --mscale-all-dim 1.0 \
+    --moe-token-dispatcher-type alltoall                \
+    --moe-enable-deepep                             \
     --enable-cuda-graph \
 ```
+
+
+srun -N2 -n2 --gres=gpu:1 python tensor_send_recv.py \
+  --batch_size 256 \
+  --hidden_dim 8192 \
+  --warmup_iters 20
