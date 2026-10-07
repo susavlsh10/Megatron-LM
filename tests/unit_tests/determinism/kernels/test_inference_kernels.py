@@ -467,9 +467,16 @@ def test_inference_default_unpermute_is_the_racy_path():
 # --- vLLM-derived fused MoE ---------------------------------------------------------------
 
 
-def test_vllm_fused_moe_and_moe_sum_replay():
+@pytest.mark.parametrize("expert_max_blocks", [None, 304], ids=["serial", "shortcut-capped"])
+def test_vllm_fused_moe_and_moe_sum_replay(expert_max_blocks):
     from megatron.core.inference.moe.fused_moe import ActivationType
-    from megatron.core.inference.moe.vllm_fused_moe import _moe_sum, vllm_fused_moe
+    from megatron.core.inference.moe.vllm_fused_moe import (
+        _moe_sum,
+        compute_vllm_moe,
+        finish_vllm_moe,
+        prepare_vllm_moe,
+        vllm_fused_moe,
+    )
 
     seeded()
     max_tokens, hidden, ffn, topk, experts = 4096, 4096, 2048, 8, 32
@@ -481,9 +488,12 @@ def test_vllm_fused_moe_and_moe_sum_replay():
     valid = _dev_scalar(max_tokens - 100)
 
     def fn(h, p):
-        out = vllm_fused_moe(
-            h, p, fc1, fc2, ActivationType.SQUARED_RELU, experts, 0, valid, routing_map
-        )
+        args = (h, p, fc1, fc2, ActivationType.SQUARED_RELU, experts, 0, valid, routing_map)
+        if expert_max_blocks is None:
+            out = vllm_fused_moe(*args)
+        else:
+            prepared = prepare_vllm_moe(*args, grid_size_limit=expert_max_blocks)
+            out = finish_vllm_moe(compute_vllm_moe(prepared))
         return out[: max_tokens - 100]
 
     assert_replays_bit_exact(
