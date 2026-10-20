@@ -937,11 +937,13 @@ def compute_vllm_moe(prepared: PreparedVllmMoE) -> ComputedVllmMoE:
         # SiLU(gate) * up over the valid_tokens*topk live rows only.
         intermediate1 = bounded_silu_mul(intermediate1, (valid_tokens * topk).to(torch.int32))
 
-    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], without routing weights.
-    # Routing weights are applied in the reduction kernel to avoid an extra
-    # bf16 truncation of prob-scaled values before the topk summation.
-    # Only local-expert blocks are processed; non-local positions are left
-    # undefined and skipped by _moe_sum (which checks the routing map).
+    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Ordinary inference
+    # multiplies each row by its routing probability in the GEMM epilogue, on
+    # the fp32 accumulator before the bf16 store (as upstream vLLM does).
+    # Batch-invariant mode already applied the probabilities at the activation
+    # to match training. Only local-expert blocks are processed; non-local
+    # positions are left undefined and skipped by _moe_sum (which checks the
+    # routing map).
     intermediate3 = VllmFusedMoeBuffers.get(
         "intermediate3", (num_valid, K), hidden_states.dtype, hidden_states.device
     )
@@ -953,7 +955,7 @@ def compute_vllm_moe(prepared: PreparedVllmMoE) -> ComputedVllmMoE:
         sorted_token_ids,
         expert_ids,
         num_post_padded,
-        mul_routed_weight=False,
+        mul_routed_weight=not batch_invariant_mode,
         top_k=1,
         config=config,
         grid_size=grid_size_fc2,
@@ -984,7 +986,8 @@ def finish_vllm_moe(computed: ComputedVllmMoE, out: torch.Tensor | None = None) 
         prepared.local_expert_start,
         prepared.num_local_experts,
         out=out,
-        apply_weights=not prepared.batch_invariant_mode,
+        # Probabilities were applied in FC2, or at the activation in invariant mode.
+        apply_weights=False,
         acc_fp64=prepared.batch_invariant_mode,
     )
 
