@@ -192,6 +192,9 @@ def _multimem_reduce_scatter_v_kernel(
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
     """
+    # Empty tensors have a null data_ptr(), which Triton infers as int32.
+    # Pointer casts require 64-bit integers even when this rank has no rows.
+    local_ptr = local_ptr.to(tl.uint64)
     pid = tl.program_id(axis=0)
 
     # Exit before the barrier if this CTA's pid exceeds the iteration maximum.
@@ -411,6 +414,11 @@ def _multimem_all_gatherv_3tensor_kernel(
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
     """
+    # Empty tensors have a null data_ptr(), which Triton infers as int32.
+    # Pointer casts require 64-bit integers even when this rank has no rows.
+    local_ptr_0 = local_ptr_0.to(tl.uint64)
+    local_ptr_1 = local_ptr_1.to(tl.uint64)
+    local_ptr_2 = local_ptr_2.to(tl.uint64)
     pid = tl.program_id(axis=0)
 
     ep_max_tokens = tl.load(ep_max_tokens_ptr)

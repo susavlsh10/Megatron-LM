@@ -450,7 +450,7 @@ class TestNVLSAllGatherVDispatcher:
         """Dispatch+combine can be captured in a CUDA graph and replayed.
 
         Uses uneven token counts across EP ranks (rank r gets
-        max(1, max_rank_tokens + r - (ep_size - 1)) tokens) to exercise the
+        max(0, max_rank_tokens + r - (ep_size - 1)) tokens) to exercise the
         AllGatherV variable-length path. Verifies:
         - AllGatherV output matches the global reference (valid prefix only)
         - ReduceScatterV output matches fp32-accumulated reference
@@ -468,10 +468,10 @@ class TestNVLSAllGatherVDispatcher:
         num_experts = NANOV3_BASE["num_moe_experts"]
         rank = torch.distributed.get_rank() if ep_size > 1 else 0
 
-        # Uneven token counts: rank r gets max(1, max_rank_tokens + r - (ep_size-1))
+        # Uneven token counts: rank r gets max(0, max_rank_tokens + r - (ep_size-1))
         # so the last rank always has max_rank_tokens (≤ engine_max) and earlier
-        # ranks have fewer, exercising the variable-length AllGatherV path.
-        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        # ranks have fewer (including zero), exercising the variable-length AllGatherV path.
+        tokens_per_rank = [max(0, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
         local_tokens = tokens_per_rank[rank]
         total_tokens = sum(tokens_per_rank)
         global_max = _NVLS_ENGINE_MAX_TOKENS * ep_size
