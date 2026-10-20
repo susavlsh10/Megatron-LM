@@ -342,7 +342,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
         ),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(K + "test_moe_kernels.py", K + "test_nemo_parallel.py"),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available.",
     ),
@@ -613,6 +613,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="torch-op",
         exempt_reason="bincount / scatter_add_ / index_add_ on integer counts: exact regardless of order.",
+    ),
+    KernelEntry(
+        name="inference_nemo_parallel_layouts",
+        sources=("megatron/core/inference/nemo_parallel.py",),
+        tests=(K + "test_nemo_parallel.py",),
+        kind="torch-op",
+        training_path=False,
+        notes="Distributed fork/join replay covers token ordering and unique residual ownership.",
     ),
     KernelEntry(
         name="inference_nvls_symmetric_memory_collectives",

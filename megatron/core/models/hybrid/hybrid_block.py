@@ -21,6 +21,7 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.nemo_parallel import NemoParallel
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_type_list_from_layer_config_list,
@@ -192,6 +193,11 @@ class HybridStack(MegatronModule):
 
         self._mhc_block_end_plan: Optional[List[bool]] = None
 
+        self.nemo_parallel = (
+            NemoParallel.create(config, pg_collection)
+            if config.inference_nemo_parallel_mixer_tp_size and not is_mtp_layer
+            else None
+        )
         self.layer_config_list = layer_config_list
         self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
             type(layer_config) is layer_utils.MambaLayerConfig
@@ -220,6 +226,19 @@ class HybridStack(MegatronModule):
         self.layers = nn.ModuleList()
         for i, layer_config in enumerate(self.layer_config_list):
             layer_number = i + 1 + pp_layer_offset
+            layer_groups = self.pg_collection
+            paired_mixer = (
+                i + 1 < len(self.layer_config_list)
+                and type(self.layer_config_list[i + 1]) is layer_utils.MoELayerConfig
+            )
+            paired = paired_mixer or type(layer_config) is layer_utils.MoELayerConfig
+            if self.nemo_parallel is not None and paired:
+                layer_config = self.nemo_parallel.layer_config(layer_config)
+                self.layer_config_list[i] = layer_config
+                layer_groups = self.nemo_parallel.branch
+                if paired_mixer and not self.nemo_parallel.is_mixer:
+                    self.layers.append(None)
+                    continue
             if layer_config.fp8:
                 quant_init_context = get_fp8_context(
                     layer_config, i + pp_layer_offset, is_init=True
@@ -237,7 +256,7 @@ class HybridStack(MegatronModule):
                         config=layer_config,
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
-                        pg_collection=pg_collection,
+                        pg_collection=layer_groups,
                         is_mtp_layer=is_mtp_layer,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
@@ -246,7 +265,7 @@ class HybridStack(MegatronModule):
                         submodules.attention_layer,
                         config=layer_config,
                         layer_number=layer_number,
-                        pg_collection=pg_collection,
+                        pg_collection=layer_groups,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
@@ -257,7 +276,7 @@ class HybridStack(MegatronModule):
                         submodules.dsa_layer,
                         config=layer_config,
                         layer_number=layer_number,
-                        pg_collection=pg_collection,
+                        pg_collection=layer_groups,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
@@ -278,7 +297,7 @@ class HybridStack(MegatronModule):
                         csa_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
-                        pg_collection=pg_collection,
+                        pg_collection=layer_groups,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
@@ -300,7 +319,7 @@ class HybridStack(MegatronModule):
                         mla_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
-                        pg_collection=pg_collection,
+                        pg_collection=layer_groups,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
@@ -310,7 +329,7 @@ class HybridStack(MegatronModule):
                         submodules.mlp_layer,
                         config=layer_config,
                         layer_number=layer_number,
-                        pg_collection=pg_collection,
+                        pg_collection=layer_groups,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
@@ -320,7 +339,7 @@ class HybridStack(MegatronModule):
                         submodules.moe_layer,
                         config=layer_config,
                         layer_number=layer_number,
-                        pg_collection=pg_collection,
+                        pg_collection=layer_groups,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         hash_moe_layer_threshold=hash_moe_layer_threshold,
@@ -340,7 +359,7 @@ class HybridStack(MegatronModule):
                         gdn_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
-                        pg_collection=pg_collection,
+                        pg_collection=layer_groups,
                         is_mtp_layer=is_mtp_layer,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
@@ -367,7 +386,7 @@ class HybridStack(MegatronModule):
             self.layers.append(layer)
 
         if self.config.cuda_graph_impl == "local":
-            annotate_first_last_layer(self.layers)
+            annotate_first_last_layer([layer for layer in self.layers if layer is not None])
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -401,7 +420,11 @@ class HybridStack(MegatronModule):
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
             self.layers = group_layers_into_shortcut_blocks(
-                self.layers, self.layer_type_list, self.config, pp_layer_offset=pp_layer_offset
+                self.layers,
+                self.layer_type_list,
+                self.config,
+                pp_layer_offset=pp_layer_offset,
+                nemo_parallel=self.nemo_parallel,
             )
             self._execution_layer_indices = [
                 (
@@ -415,6 +438,9 @@ class HybridStack(MegatronModule):
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
+
+        if self.nemo_parallel is not None:
+            self.nemo_parallel.register_layers(self.physical_layers())
 
     def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:
         """Return physical layer indices that must share one residual replay block."""
@@ -489,6 +515,16 @@ class HybridStack(MegatronModule):
         Returns the recurrent mixer's conv and SSM state shapes per input sequence
         if this block contains Mamba or GDN layers (this may not be the case with PP > 1).
         """
+        if self.nemo_parallel is not None:
+            import math
+
+            shapes = list(self.nemo_parallel.state_shapes.values())
+            if not shapes:
+                return None
+            return (
+                max((shape[0] for shape in shapes), key=math.prod),
+                max((shape[1] for shape in shapes), key=math.prod),
+            )
         for layer_config, layer in zip(self.layer_config_list, self.physical_layers(), strict=True):
             if type(layer_config) is layer_utils.MambaLayerConfig:
                 return layer.mamba_state_shapes_per_request()

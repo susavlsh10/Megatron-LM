@@ -842,6 +842,14 @@ class TransformerConfig(ModelParallelConfig):
     CUDA graphs are not supported. For the first MoE layer (no preceding layer), falls back to 
     standard routing."""
 
+    inference_nemo_parallel_mixer_tp_size: int = 0
+    """Mixer TP size for disjoint shortcut-branch inference; zero disables Nemo Parallel.
+    The expert pool uses the remaining ranks of the model TP group.
+    """
+
+    inference_nemo_parallel_role: Optional[str] = field(default=None, init=False, repr=False)
+    """Internal branch ownership assigned at model construction."""
+
     inference_shortcut_moe_overlap: bool = False
     """Overlap Shortcut MoE routing, expert compute and communication with GDP or attention inference.
     The unsplit predecessor and routed experts run independently until their

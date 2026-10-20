@@ -72,6 +72,12 @@ class SymmetricMemoryBuffer:
             self.init_failure_reason = "triton not installed"
             self.symm_buffer = None
             self.symm_mem_hdl = None
+        elif process_group.size() & (process_group.size() - 1):
+            # The Triton barrier uses tl.arange(0, world_size). Non-power-of-two
+            # groups use the existing NCCL fallback instead.
+            self.init_failure_reason = "Triton NVLS requires a power-of-two group size"
+            self.symm_buffer = None
+            self.symm_mem_hdl = None
         else:
             numel = int(size_in_mb * 1024 * 1024)  # size in bytes
             try:
@@ -164,7 +170,7 @@ class SymmetricMemoryManager:
         result = buf.maybe_get_tensor(shape, dtype)
     """
 
-    _buffers: dict[str, SymmetricMemoryBuffer] = {}
+    _buffers: dict[tuple[str, str], SymmetricMemoryBuffer] = {}
     _default_size_mb: int = 512
 
     @classmethod
@@ -182,14 +188,19 @@ class SymmetricMemoryManager:
                 Subsequent calls may omit it.
             size_mb: Buffer size in MiB (default 256).
         """
-        if key not in cls._buffers:
-            assert (
-                process_group is not None
-            ), f"SymmetricMemoryManager: process_group is required on first access for key='{key}'"
-            cls._buffers[key] = SymmetricMemoryBuffer(
+        if process_group is None:
+            matches = [value for (name, _), value in cls._buffers.items() if name == key]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"Specify process_group for ambiguous or uninitialized buffer {key!r}"
+                )
+            return matches[0]
+        identity = (key, process_group.group_name)
+        if identity not in cls._buffers:
+            cls._buffers[identity] = SymmetricMemoryBuffer(
                 size_in_mb=size_mb or cls._default_size_mb, process_group=process_group
             )
-        return cls._buffers[key]
+        return cls._buffers[identity]
 
     @classmethod
     def destroy(cls, key: Optional[str] = None) -> None:
@@ -199,11 +210,12 @@ class SymmetricMemoryManager:
             key: If provided, destroy only that buffer. Otherwise destroy all.
         """
         if key is not None:
-            cls._buffers.pop(key, None)
+            for identity in [item for item in cls._buffers if item[0] == key]:
+                cls._buffers.pop(identity)
         else:
             cls._buffers.clear()
 
     @classmethod
     def is_initialized(cls, key: str) -> bool:
         """Check whether a buffer has been created for *key*."""
-        return key in cls._buffers
+        return any(item[0] == key for item in cls._buffers)

@@ -2053,6 +2053,8 @@ def _validate_shortcut_moe_inference_args(args: argparse.Namespace) -> None:
 
 def _add_inference_args(parser):
     group = parser.add_argument_group(title='inference')
+    group.add_argument('--inference-nemo-parallel-mixer-tp-size', type=int, default=0,
+                       help='Mixer TP ranks for Nemo Parallel; remaining model TP ranks run experts.')
 
     group.add_argument(
         '--inference-shortcut-moe-overlap',
@@ -2373,6 +2375,8 @@ def _add_inference_args(parser):
 def _add_network_size_args(parser):
     exclude = [
         # Production overlap controls are registered in the inference argument group.
+        "inference_nemo_parallel_mixer_tp_size",
+        "inference_nemo_parallel_role",
         "inference_shortcut_moe_overlap",
         "inference_shortcut_moe_expert_max_blocks",
         # cannot provide callables over CLI

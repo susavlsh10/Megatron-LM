@@ -61,6 +61,7 @@ def group_layers_into_shortcut_blocks(
     layer_type_list: Sequence[str],
     config: TransformerConfig,
     pp_layer_offset: int = 0,
+    nemo_parallel=None,
 ) -> torch.nn.ModuleList:
     """Group physical layers into their registered shortcut-block hierarchy.
 
@@ -111,7 +112,7 @@ def group_layers_into_shortcut_blocks(
             isinstance(compute_layer, TwoStageAttentionLayer)
             and compute_layer.supports_two_stage_attention()
         )
-        if not supports_two_stage:
+        if not supports_two_stage and nemo_parallel is None:
             raise ValueError(
                 f"Shortcut attention layer {paired_type!r} does not support two-stage attention"
             )
@@ -123,6 +124,7 @@ def group_layers_into_shortcut_blocks(
                 overlap_a2a=config.moe_shortcut_parallel,
                 attn_local_idx=physical_index,
                 moe_local_idx=physical_index + 1,
+                nemo_parallel=nemo_parallel,
             )
         )
         physical_index += 2
@@ -152,13 +154,15 @@ class ShortcutMoEBlock(MegatronModule):
         overlap_a2a: bool,
         attn_local_idx: int | None = None,
         moe_local_idx: int | None = None,
+        nemo_parallel=None,
     ):
-        super().__init__(compute_layer.config)
+        super().__init__(compute_layer.config if compute_layer is not None else moe_layer.config)
+        self.nemo_parallel = nemo_parallel
 
         self.overlap_mode = overlap_a2a
         self.inference_overlap = self.config.inference_shortcut_moe_overlap
-        self.layer_number = compute_layer.layer_number
-        self.attn_layer_idx = compute_layer.layer_number - 1
+        self.layer_number = moe_layer.layer_number - 1
+        self.attn_layer_idx = self.layer_number - 1
         self.attn_local_idx = attn_local_idx
         self.moe_layer_idx = moe_layer.layer_number - 1
         self.moe_local_idx = moe_local_idx
@@ -184,8 +188,13 @@ class ShortcutMoEBlock(MegatronModule):
         if compute_is_mtp != moe_is_mtp:
             raise ValueError("A ShortcutMoE pair must agree on whether it belongs to MTP.")
         self.is_mtp_layer = moe_is_mtp
-        if not self.is_mtp_layer and (
-            (compute_layer.config.wide_residual is None) != (moe_layer.config.wide_residual is None)
+        if (
+            compute_layer is not None
+            and not self.is_mtp_layer
+            and (
+                (compute_layer.config.wide_residual is None)
+                != (moe_layer.config.wide_residual is None)
+            )
         ):
             raise ValueError(
                 "A ShortcutMoE pair must agree on whether it carries a wide residual stream."
@@ -212,7 +221,11 @@ class ShortcutMoEBlock(MegatronModule):
                     "same residual-stream width."
                 )
             predecessor_stream_width = getattr(compute_layer, "residual_stream_hidden_size", None)
-            if predecessor_stream_width != self.shortcut_residual_read.residual_stream_hidden_size:
+            if (
+                compute_layer is not None
+                and predecessor_stream_width
+                != self.shortcut_residual_read.residual_stream_hidden_size
+            ):
                 raise ValueError(
                     "The shortcut predecessor and routed read must carry the same "
                     "residual-stream width."
@@ -240,6 +253,23 @@ class ShortcutMoEBlock(MegatronModule):
         self.route_ready_event = (
             torch.cuda.Event() if self.overlap_mode or self.inference_overlap else None
         )
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Keep branch weights sharded and identify cross-pool controller replicas."""
+        state = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if self.nemo_parallel is not None:
+            for key, value in state.items():
+                # Compute/shared/routed parameters have a unique owning pool. The
+                # surrounding norms and residual controllers are replicated in both.
+                if key.startswith(prefix + "compute_layer.") or key.startswith(
+                    prefix + "moe_layer.mlp."
+                ):
+                    continue
+                if hasattr(value, "replica_id"):
+                    replica = value.replica_id
+                    replica = replica if isinstance(replica, tuple) else (replica,)
+                    value.replica_id = (int(not self.nemo_parallel.is_mixer), *replica)
+        return state
 
     def _read_shortcut_hidden(
         self,
@@ -325,6 +355,25 @@ class ShortcutMoEBlock(MegatronModule):
     ):
         """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA."""
         output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
+        return self._postprocess_merged(
+            output,
+            residual,
+            mlp_state,
+            packed_seq_params=packed_seq_params,
+            moe_unflatten_mbs=moe_unflatten_mbs,
+            recompute_context=recompute_context,
+        )
+
+    def _postprocess_merged(
+        self,
+        output,
+        residual,
+        mlp_state,
+        packed_seq_params=None,
+        moe_unflatten_mbs=None,
+        recompute_context=None,
+    ):
+        """Apply the architecture's post-norm and residual write to merged branch output."""
         post_norm_input = output
         post_norm_manager = self.off_interface(
             self.offload_shortcut_post_norm
@@ -613,6 +662,19 @@ class ShortcutMoEBlock(MegatronModule):
             assert inference_context is None, (
                 "Shortcut-MoE received an inference context outside inference mode; the two-stage "
                 "schedule does not update KV-cache or recurrent inference state."
+            )
+        if inference and self.nemo_parallel is not None:
+            from megatron.core.inference.nemo_parallel import forward_shortcut_pair
+
+            return forward_shortcut_pair(
+                self,
+                hidden_states,
+                inference_context,
+                attention_mask,
+                rotary_pos_emb,
+                sequence_len_offset,
+                packed_seq_params,
+                padding_mask,
             )
         if inference and self.inference_overlap:
             return self._forward_inference_overlap(

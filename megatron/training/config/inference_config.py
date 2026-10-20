@@ -411,6 +411,7 @@ class InferenceSetupConfig:
             mamba_inference_state_config=mamba_inference_state_config,
             mtp_layer_type_list=mtp_layer_types_from_model(model),
             pg_collection=pg_collection,
+            nemo_parallel=getattr(get_attr_wrapped_model(model, "decoder"), "nemo_parallel", None),
             use_flashinfer_fused_rope=self.use_flashinfer_fused_rope,
             materialize_only_last_token_logits=(
                 not (self.return_log_probs and not self.skip_prompt_log_probs)

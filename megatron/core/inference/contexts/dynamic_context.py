@@ -437,6 +437,19 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.num_attention_heads_per_partition = 1
 
         self.batch_invariant_mode = model_config.batch_invariant_mode
+        self.nemo_parallel = inference_config.nemo_parallel
+        self.token_alignment = self.nemo_parallel.alignment if self.nemo_parallel else tp_size
+        if self.nemo_parallel is not None:
+            if inference_config.num_speculative_tokens or inference_config.enable_prefix_caching:
+                raise ValueError(
+                    "Nemo Parallel currently requires ordinary decode without prefix caching"
+                )
+            self.num_attention_heads_per_partition = max(
+                self.nemo_parallel.attention_heads.values(),
+                default=self.num_attention_heads_per_partition,
+            )
+            if inference_config.kv_cache_management_mode != KVCacheManagementMode.PERSIST:
+                raise ValueError("Nemo Parallel currently requires persistent inference caches")
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
@@ -758,6 +771,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ), f"max_requests must be divisible by tp_size ({tp_size}), but got {self.max_requests}"
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
+        if self.nemo_parallel is not None and (
+            self.max_requests % self.token_alignment or self.max_tokens % self.token_alignment
+        ):
+            raise ValueError(
+                "Nemo Parallel max_requests and max_tokens must be multiples of "
+                f"the TP layout alignment ({self.token_alignment})"
+            )
 
         # Per-step upper bound on Mamba intermediate-state extractions, shared with
         # MambaMetadata and MambaSlotAllocator so scratch/metadata buffers and the
@@ -810,6 +830,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
+        if self.nemo_parallel is not None:
+            self.nemo_parallel.initialize_buffers(model_config, self.max_tokens)
+            self.expert_tensor_and_model_parallel_group = (
+                self.nemo_parallel.branch.tp if not self.nemo_parallel.is_mixer else None
+            )
         # are we using the inference_optimized nvls ep dispatcher for MoEs?
         # The NVLS dispatcher gathers over the tp_ep group, so it is also active
         # for EP == 1 with expert tensor parallelism (ETP > 1).
@@ -850,7 +875,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # CUDA graph config list.
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
-                tp_size=tp_size,
+                tp_size=self.token_alignment,
                 num_cuda_graphs=inference_config.num_cuda_graphs,
                 cuda_graph_max_tokens=cuda_graph_max_tokens,
                 cuda_graph_mixed_prefill_request_count=inference_config.cuda_graph_mixed_prefill_count,
@@ -878,7 +903,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_buffers(
-                per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
+                per_rank_worst_case_token_count=self.round_up_tokens(
+                    self.max_tokens, self.token_alignment
+                )
+                // (self.nemo_parallel.expert_size if self.nemo_parallel else tp_size),
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 tp_ep_group=self.expert_tensor_and_model_parallel_group,
@@ -890,6 +918,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # engine suspend/resume.
         if (
             model_config.num_moe_experts
+            and not (self.nemo_parallel and self.nemo_parallel.is_mixer)
             and model_config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
         ):
             ep_size = get_pg_size(self.expert_model_parallel_group)
@@ -899,7 +928,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # Worst-case rows entering the MoE: the fixed NVLS AGV buffer height
             # (per-rank worst case * tp_ep_size); max_tokens covers the EP=1 / NCCL paths.
             moe_max_rows = max(
-                self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * tp_ep_size
+                self.max_tokens,
+                self.round_up_tokens(self.max_tokens, self.token_alignment)
+                // (self.nemo_parallel.expert_size if self.nemo_parallel else tp_size)
+                * tp_ep_size,
             )
             VllmFusedMoeBuffers.allocate_buffers(
                 max_tokens=moe_max_rows,
@@ -1110,16 +1142,36 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 )
             self.mamba_metadata.bind_cpu_buffers(_mamba_cpu_bufs)
             self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
-            self.mamba_conv_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
-                dtype=self.mamba_conv_states_dtype,
-                device=torch.cuda.current_device(),
-            )
-            self.mamba_ssm_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                dtype=self.mamba_ssm_states_dtype,
-                device=torch.cuda.current_device(),
-            )
+            if self.nemo_parallel is not None:
+                self._nemo_states = {
+                    layer: (
+                        torch.empty(
+                            (self.max_requests, *shapes[0]),
+                            dtype=self.mamba_conv_states_dtype,
+                            device="cuda",
+                        ),
+                        torch.empty(
+                            (self.max_requests, *shapes[1]),
+                            dtype=self.mamba_ssm_states_dtype,
+                            device="cuda",
+                        ),
+                    )
+                    for layer, shapes in self.nemo_parallel.state_shapes.items()
+                }
+                first_conv, first_ssm = next(iter(self._nemo_states.values()))
+                self.mamba_conv_states = first_conv.unsqueeze(0)
+                self.mamba_ssm_states = first_ssm.unsqueeze(0)
+            else:
+                self.mamba_conv_states = torch.empty(
+                    (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
+                    dtype=self.mamba_conv_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
+                self.mamba_ssm_states = torch.empty(
+                    (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
+                    dtype=self.mamba_ssm_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
             if self.num_speculative_tokens > 0:
                 self.mamba_intermediate_conv_states = torch.empty(
                     (
@@ -1876,6 +1928,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             key (Tensor): Key tensor.
             value (Tensor): Value tensor.
         """
+        memory_buffer = self.memory_buffer
+        if self.nemo_parallel is not None and not self.cache_mla_latent:
+            heads = self.nemo_parallel.attention_heads[layer_number - 1]
+            memory_buffer = memory_buffer[..., :heads, :]
         if self.mtp_metadata.forward_active:
             # Redirect the MTP draft attention to its reserved KV-buffer slot regardless of the
             # inner layer's layer_number (which reuses decoder numbering for router/aux-loss).
@@ -1889,7 +1945,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 layer_number=attention_layer_number,
                 key=key,
                 value=value,
-                memory_buffer=self.memory_buffer,
+                memory_buffer=memory_buffer,
                 padded_active_token_count=self.padded_active_token_count,
                 token_to_block_idx=self.gpu_view.token_to_block_idx,
                 token_to_local_position_within_kv_block=self.gpu_view.token_to_local_position_within_kv_block,
@@ -1912,14 +1968,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.cache_mla_latent:
             # We pass the kv_concat as the key in cache_mla_latent
             kv_concat = key
-            self.memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = kv_concat[
+            memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = kv_concat[
                 : self.padded_active_token_count
             ]
         else:
-            self.memory_buffer[0, attention_layer_number, block_idx, local_kv_seq_idx] = key[
+            memory_buffer[0, attention_layer_number, block_idx, local_kv_seq_idx] = key[
                 : self.padded_active_token_count
             ]
-            self.memory_buffer[1, attention_layer_number, block_idx, local_kv_seq_idx] = value[
+            memory_buffer[1, attention_layer_number, block_idx, local_kv_seq_idx] = value[
                 : self.padded_active_token_count
             ]
 
@@ -1933,6 +1989,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             (Tuple[Tensor, Tensor, Tensor]) The key and value pointer tensors that point
             to blocks within the block-level memory buffer as well as the block table.
         """
+        memory_buffer = self.memory_buffer
+        if self.nemo_parallel is not None and not self.cache_mla_latent:
+            heads = self.nemo_parallel.attention_heads[layer_number - 1]
+            memory_buffer = memory_buffer[..., :heads, :]
         if self.mtp_metadata.forward_active:
             attention_layer_number = self.mtp_kv_layer_slot
         else:
@@ -1942,14 +2002,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         if self.cache_mla_latent:
             return (
-                self.memory_buffer[attention_layer_number],
+                memory_buffer[attention_layer_number],
                 None,
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
         else:
             return (
-                self.memory_buffer[0, attention_layer_number],
-                self.memory_buffer[1, attention_layer_number],
+                memory_buffer[0, attention_layer_number],
+                memory_buffer[1, attention_layer_number],
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
 
@@ -1959,6 +2019,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         """Returns the Mamba state tensors for the given layer."""
         assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
 
+        if self.nemo_parallel is not None:
+            if intermediate:
+                raise RuntimeError("Nemo Parallel does not support speculative cache state")
+            return self._nemo_states[layer_number - 1]
         mamba_layer_number = self.layer_map[layer_number - 1]
         if intermediate:
             conv_state = self.mamba_intermediate_conv_states[mamba_layer_number]
@@ -2568,12 +2632,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     padded_token_count = min(
                         self.max_tokens,
                         self.max_requests,
-                        self.round_up_tokens(self.active_token_count),
+                        self.round_up_tokens(self.active_token_count, self.token_alignment),
                     )
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = self.round_up_tokens(
+                    self.active_token_count, self.token_alignment
+                )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
@@ -2802,8 +2868,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self._pending_mamba_zeros:
             device = self.mamba_conv_states.device
             indices = torch.tensor(self._pending_mamba_zeros, dtype=torch.long, device=device)
-            self.mamba_conv_states[:, indices] = 0.0
-            self.mamba_ssm_states[:, indices] = 0.0
+            if self.nemo_parallel is not None:
+                for conv, ssm in self._nemo_states.values():
+                    conv[indices] = 0.0
+                    ssm[indices] = 0.0
+            else:
+                self.mamba_conv_states[:, indices] = 0.0
+                self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
     def transfer_bookkeeping_to_gpu(

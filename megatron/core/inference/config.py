@@ -98,9 +98,10 @@ class MambaInferenceStateConfig:
                 and model.config.experimental_attention_variant == "gdn2"
             ):
                 raise NotImplementedError("GDN2 does not support dynamic inference.")
-            mamba_conv_states_shape, mamba_ssm_states_shape = (
-                decoder.mamba_state_shapes_per_request()
-            )
+            shapes = decoder.mamba_state_shapes_per_request()
+            if shapes is None:
+                return None
+            mamba_conv_states_shape, mamba_ssm_states_shape = shapes
             if conv_states_dtype is None:
                 conv_states_dtype = model.config.params_dtype
             if model.config.batch_invariant_mode:
@@ -624,6 +625,9 @@ class InferenceConfig:
 
     pg_collection: Optional[ProcessGroupCollection] = None
     """A `ProcessGroupCollection` for distributed execution."""
+
+    nemo_parallel: object = None
+    """Runtime shortcut-branch placement, shared with the constructed hybrid stack."""
 
     image_preprocessing_config: Optional[ImageProcessingConfig] = None
     """Configuration for preprocessing raw image payloads."""

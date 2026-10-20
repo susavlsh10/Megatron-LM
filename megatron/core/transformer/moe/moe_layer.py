@@ -224,7 +224,8 @@ class BaseMoELayer(MegatronModule, ABC):
     def set_layer_number(self, layer_number: int):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
-        self.router.set_layer_number(layer_number)
+        if self.router is not None:
+            self.router.set_layer_number(layer_number)
 
 
 class MoELayer(BaseMoELayer):
@@ -273,19 +274,23 @@ class MoELayer(BaseMoELayer):
 
         self.tp_group = pg_collection.tp
 
+        role = config.inference_nemo_parallel_role
+        if role == "expert":
+            self.use_shared_expert = False
         # Initialize router.
-        self.router = self.submodules.router(
-            config=self.config,
-            pg_collection=pg_collection,
-            is_mtp_layer=is_mtp_layer,
-            hash_moe_layer_threshold=hash_moe_layer_threshold,
-        )
-        if layer_number is not None:
-            self.router.set_layer_number(layer_number)
+        if role != "mixer":
+            self.router = self.submodules.router(
+                config=self.config,
+                pg_collection=pg_collection,
+                is_mtp_layer=is_mtp_layer,
+                hash_moe_layer_threshold=hash_moe_layer_threshold,
+            )
+            if layer_number is not None:
+                self.router.set_layer_number(layer_number)
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
-        if self.config.moe_latent_size:
+        if self.config.moe_latent_size and role != "mixer":
             assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
             if self.config.transformer_impl == "inference_optimized":
                 from megatron.core.tensor_parallel.inference_layers import InferenceLinear
@@ -336,11 +341,10 @@ class MoELayer(BaseMoELayer):
                 name=(name + ".fc2_latent_proj") if name is not None else None,
                 **linear_gtp_kwargs,
             )
-            if linear_cls is TELinear:
-                # The duplicated operation has no TP execution group. TELinear uses
-                # `_tp_group` only to encode the owning TP replica coordinate in checkpoints.
-                self.fc1_latent_proj._tp_group = pg_collection.tp
-                self.fc2_latent_proj._tp_group = pg_collection.tp
+            # Both backends inherit TELinear checkpoint metadata. The duplicated
+            # operation has no TP execution group; this only identifies its replicas.
+            self.fc1_latent_proj._tp_group = pg_collection.tp
+            self.fc2_latent_proj._tp_group = pg_collection.tp
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -370,12 +374,13 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize experts
-        self.experts = self.submodules.experts(
-            self.num_local_experts,
-            self.config,
-            pg_collection=pg_collection,
-            name=(name + ".experts") if name is not None else None,
-        )
+        if role != "mixer":
+            self.experts = self.submodules.experts(
+                self.num_local_experts,
+                self.config,
+                pg_collection=pg_collection,
+                name=(name + ".experts") if name is not None else None,
+            )
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -392,7 +397,7 @@ class MoELayer(BaseMoELayer):
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
         # Inference-optimized mode setup
-        if config.transformer_impl == "inference_optimized":
+        if config.transformer_impl == "inference_optimized" and role != "mixer":
             if config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
                 assert HAVE_FLASHINFER, (
                     "inference_grouped_gemm_backend='flashinfer' requires flashinfer-python. "
@@ -646,20 +651,18 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.token_combine(output)
         return output
 
-    def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
-        """Project the output back from latent dimension to hidden dimension after combine
-        in latent dimension if needed. Combine expert output with shared_experts if needed.
-
-        _latent_shared_expert_output is inference-only (latent-MoE + NVLS dispatcher with
-        shared-expert overlap). It is populated in preprocess and joined here, after
-        fc2_latent_proj, so the dimensions match the full hidden dim."""
-
+    def routed_experts_postprocess(self, output: torch.Tensor):
+        """Finish expert combination and latent projection before joining the shared path."""
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
+        return output
 
+    def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
+        """Finish the routed path and add the shared expert output."""
+        output = self.routed_experts_postprocess(output)
         if shared_expert_output is not None:
             output = output + shared_expert_output
         elif (

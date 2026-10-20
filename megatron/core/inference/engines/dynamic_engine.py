@@ -1391,6 +1391,10 @@ class DynamicInferenceEngine(AbstractEngine):
         # the EP group; with ETP > 1 it also includes the expert-TP peers.
         # Falls back to the EP group for pg_collections built without tp_ep.
         tp_ep_group = getattr(self.pg_collection, "tp_ep", self.pg_collection.ep)
+        if getattr(self.context, "nemo_parallel", None) is not None:
+            # Both branch pools must choose the same step and graph bucket, even
+            # when the configured expert-TP group covers only part of the replica.
+            tp_ep_group = self.context.nemo_parallel.full.tp
         self.tp_ep_rank = get_pg_rank(tp_ep_group)
         self.tp_ep_world_size = get_pg_size(tp_ep_group)
         self._ep_consensus_loop_counter = 0
