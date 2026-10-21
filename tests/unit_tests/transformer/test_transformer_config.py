@@ -617,3 +617,21 @@ def test_shortcut_inference_overlap_cli_has_only_production_controls():
     assert enabled.inference_shortcut_moe_overlap
     assert disabled.inference_shortcut_moe_overlap is False
     assert disabled.inference_shortcut_moe_expert_max_blocks == 0
+
+
+def test_fused_tp_inference_rejects_replicated_activations():
+    with pytest.raises(AssertionError, match="requires sequence parallelism"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+            transformer_impl="inference_optimized",
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            add_qkv_bias=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            sequence_parallel=False,
+            inference_fuse_tp_communication=True,
+        )

@@ -18,7 +18,13 @@ except ImportError:
 
 
 @triton.jit
-def ld_128(ptr, mask, multicast_op: tl.constexpr, reduce_f32: tl.constexpr = False):
+def ld_128(
+    ptr,
+    mask,
+    multicast_op: tl.constexpr,
+    reduce_f32: tl.constexpr = False,
+    cache_global: tl.constexpr = False,
+):
     """
     Loads 128 bits from memory into registers.
 
@@ -45,6 +51,7 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr, reduce_f32: tl.constexpr = Fal
             and multicast-reduce (True).
         reduce_f32 (tl.constexpr): When True and multicast_op=True, uses f32 reduction
             instead of bf16x2 reduction. Default False.
+        cache_global (tl.constexpr): Bypass L1 for local loads after peer multicast stores.
 
     Returns:
         Four 32-bit registers (tl.uint32), representing 128 bits of loaded data.
@@ -90,19 +97,19 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr, reduce_f32: tl.constexpr = Fal
             )
     else:
         return tl.inline_asm_elementwise(
-            """
-        {
+            f"""
+        {{
             .reg .pred %p0;
             setp.ne.s32 %p0, $5, 1;
             @%p0 bra end;
-            ld.global.v4.u32 {$0, $1, $2, $3}, [$4];
+            ld.global{'.cg' if cache_global else ''}.v4.u32 {{$0, $1, $2, $3}}, [$4];
             end:
-        }
+        }}
         """,
             "=r,=r,=r,=r,l,r",
             args=[ptr, mask.to(tl.int32)],
             dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
-            is_pure=True,
+            is_pure=not cache_global,
             pack=1,
         )
 

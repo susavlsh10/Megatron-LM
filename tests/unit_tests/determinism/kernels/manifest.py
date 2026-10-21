@@ -623,9 +623,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/communication/all_reduce.py",
         ),
         tests=(K + "test_nemo_parallel.py",),
-        kind="torch-op",
+        kind="triton",
         training_path=False,
-        notes="Distributed fork/join replay covers token ordering and unique residual ownership.",
+        notes="Distributed layout and BF16/FP32 collective replay covers token ordering, "
+        "unique residual ownership and consistent replicated reductions.",
     ),
     KernelEntry(
         name="inference_nvls_symmetric_memory_collectives",

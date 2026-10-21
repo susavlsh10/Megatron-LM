@@ -3932,6 +3932,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.inference_fuse_tp_communication:
+            assert (
+                self.sequence_parallel
+            ), "inference_fuse_tp_communication requires sequence parallelism."
             assert self.transformer_impl == "inference_optimized", (
                 "inference_fuse_tp_communication is only supported "
                 "for inference_optimized transformer implementation."

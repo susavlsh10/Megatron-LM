@@ -22,6 +22,8 @@ from tests.unit_tests.test_utilities import Utils
         (2, False, "fork"),
         (3, False, "fork"),
         (2, False, "persistent"),
+        (2, True, "persistent"),
+        (3, False, "persistent"),
         (2, False, "replicated"),
     ],
 )
@@ -55,7 +57,7 @@ def test_branch_layout_and_graph_replay(mixer_size, disable_nvls, layout):
             buffer = SymmetricMemoryManager.get_buffer("nemo_test", plan.branch.tp, size_mb=1)
             assert buffer.symm_mem_hdl is None
             assert "power-of-two" in buffer.init_failure_reason
-        tokens = plan.alignment * 2
+        tokens = 1 if layout == "replicated" else plan.alignment * 2
         plan.initialize_buffers(config, tokens)
         complete = torch.arange(tokens * 8, device="cuda", dtype=torch.float32).view(tokens, 1, 8)
         complete = complete.bfloat16()
@@ -131,37 +133,63 @@ def test_replicated_all_reduce_replay(disable_nvls):
         group = ProcessGroupCollection.use_mpu_process_groups().tp
         reduce = InferenceAllReduce(group, disable_nvls)
         for dtype in (torch.bfloat16, torch.float32):
-            data = torch.arange(128, device="cuda", dtype=torch.float32).view(8, 16) / 8
+            data = torch.arange(192, device="cuda", dtype=torch.float32).view(12, 16) / 8
             local = (data + Utils.rank).to(dtype)
+            start = Utils.rank * 4 if Utils.rank < 3 else 0
+            count = 4 if Utils.rank < 3 else 12
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 for _ in range(3):
                     reduce(local)
+                    reduce(local, output_start=start, output_tokens=count)
             torch.cuda.current_stream().wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 result = reduce(local)
+                selected = reduce(local, output_start=start, output_tokens=count)
             for delta in (0, 1):
                 local.copy_((data + Utils.rank + delta).to(dtype))
                 graph.replay()
                 torch.testing.assert_close(
                     result, (data * 4 + 6 + 4 * delta).to(dtype), atol=0, rtol=0
                 )
+                torch.testing.assert_close(
+                    selected,
+                    (data * 4 + 6 + 4 * delta).to(dtype).narrow(0, start, count),
+                    atol=0,
+                    rtol=0,
+                )
+            # Replicated routing requires identical reduction results on every
+            # rank, including non-integer inputs with real rounding decisions.
+            generator = torch.Generator(device="cuda").manual_seed(713 + Utils.rank)
+            local.copy_(torch.randn(local.shape, device="cuda", generator=generator).to(dtype))
+            graph.replay()
+            replicas = torch.empty((48, 16), device="cuda", dtype=dtype)
+            torch.distributed.all_gather_into_tensor(replicas, result, group=group)
+            for replica in replicas.chunk(4):
+                torch.testing.assert_close(replica, result, atol=0, rtol=0)
+            torch.testing.assert_close(
+                selected,
+                result.narrow(0, start, count),
+                atol=0 if dtype == torch.bfloat16 else 1e-6,
+                rtol=0 if dtype == torch.bfloat16 else 1e-6,
+            )
     finally:
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
 
-def test_unsharded_tp1_expert_parallel_dispatch_replay():
-    """TP1/EP4 tokens remain distinct even though sequence parallelism is disabled."""
+@pytest.mark.parametrize("ep_size,expert_tp_size", [(4, 1), (1, 4)])
+def test_unsharded_tp1_expert_parallel_dispatch_replay(ep_size, expert_tp_size):
+    """TP1 inputs remain distinct across EP or expert TP despite SP being disabled."""
     from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
     from megatron.core.transformer.transformer_config import TransformerConfig
 
     if Utils.world_size != 4:
         pytest.skip("This EP compatibility regression uses four ranks")
     Utils.initialize_model_parallel(
-        1, 1, expert_model_parallel_size=4, expert_tensor_parallel_size=1
+        1, 1, expert_model_parallel_size=ep_size, expert_tensor_parallel_size=expert_tp_size
     )
     try:
         groups = ProcessGroupCollection.use_mpu_process_groups()
@@ -171,11 +199,17 @@ def test_unsharded_tp1_expert_parallel_dispatch_replay():
             num_attention_heads=4,
             num_moe_experts=8,
             moe_router_topk=2,
-            expert_model_parallel_size=4,
+            expert_model_parallel_size=ep_size,
+            expert_tensor_parallel_size=expert_tp_size,
             sequence_parallel=False,
+            add_bias_linear=False,
         )
-        rank = groups.ep.rank()
-        dispatcher = NVLSAllGatherVDispatcher(2, [2 * rank, 2 * rank + 1], config, groups)
+        rank = groups.tp_ep.rank()
+        local_experts = 8 // ep_size
+        first_expert = groups.ep.rank() * local_experts
+        dispatcher = NVLSAllGatherVDispatcher(
+            local_experts, list(range(first_expert, first_expert + local_experts)), config, groups
+        )
         assert not dispatcher.replicated_input
         NVLSAllGatherVDispatcher._delete_buffers()
         NVLSAllGatherVDispatcher.allocate_buffers(8, 2, 32, groups.tp_ep)
@@ -231,6 +265,7 @@ def test_hybrid_checkpoint_resharding_and_caches(tmp_path):
     )
     from megatron.core.models.hybrid.hybrid_model import HybridModel
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.wide_residual_config import WideResidualConfig
 
@@ -382,6 +417,8 @@ def test_hybrid_checkpoint_resharding_and_caches(tmp_path):
                 assert (pair.moe_layer.mlp.experts is None) == plan.is_mixer
                 assert (pair.moe_layer.mlp.shared_experts is not None) == plan.is_mixer
                 context = make_context(model, alignment)
+                if plan.expert_size == 1 and not plan.is_mixer:
+                    assert NVLSAllGatherVDispatcher._get_rsv_tensor() is None
                 mixer_states = {0, 2} if case == 0 else {0}
                 expert_states = {2} if case == 0 else set()
                 assert set(plan.state_shapes) == (mixer_states if plan.is_mixer else expert_states)

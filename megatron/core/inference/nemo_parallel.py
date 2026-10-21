@@ -48,6 +48,8 @@ class NemoParallel:
 
     @property
     def alignment(self):
+        if self.mode == "replicated":
+            return 1
         return math.lcm(self.full.tp.size(), self.mixer_size, self.expert_size)
 
     @classmethod
@@ -176,7 +178,7 @@ class NemoParallel:
         return gathered.narrow(0, start, count).contiguous()
 
     def join(self, update, residual, residual_width, config, branch_output=False):
-        """Join completed branches and return full-group SP output and mixer residual.
+        """Join branches into the requested replicated or sequence-sharded layout.
 
         Every token has one shared contribution, one routed contribution, and
         exactly one residual owner. FP32 transport preserves residual precision;
@@ -185,7 +187,8 @@ class NemoParallel:
         local_tokens = update.shape[0]
         tokens = local_tokens * (1 if self.mode == "replicated" else self.branch.tp.size())
         shape = (tokens, *update.shape[1:-1], residual_width + update.shape[-1])
-        output_shape = (tokens // self.full.tp.size(), *shape[1:])
+        output_tokens = tokens if self.mode == "replicated" else tokens // self.full.tp.size()
+        output_shape = (output_tokens, *shape[1:])
         buffer = (
             self.join_buffer.maybe_get_tensor(shape, torch.float32)
             if self.join_buffer is not None
@@ -205,10 +208,12 @@ class NemoParallel:
             if residual is not None:
                 target[..., :residual_width].copy_(residual)
             target[..., residual_width:].copy_(update)
-        if self.mode == "replicated" or branch_output:
+        if branch_output:
+            joined = self.join_reduce(
+                payload, buffer=buffer, output_start=start, output_tokens=local_tokens
+            )
+        elif self.mode == "replicated":
             joined = self.join_reduce(payload, buffer=buffer)
-            if branch_output:
-                joined = joined.narrow(0, start, local_tokens)
         elif use_nvls:
             joined = torch.empty(output_shape, dtype=torch.float32, device=update.device)
             multimem_reduce_scatter(joined, payload, buffer["handle"])

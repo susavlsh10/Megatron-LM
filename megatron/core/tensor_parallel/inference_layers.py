@@ -455,13 +455,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             else None
         )
 
-    def _matmul_reduce_scatter(self, x, residual=None):
-        """
-        Multiplies x by the weight matrix and performs a reduce-scatter.
-        It will first try to write the matmul output to symmetric memory
-        and perform an NVLS multicast reduce-scatter. If that is not possible,
-        it will revert to torch.dist (NCCL) reduce-scatter.
-        """
+    def _matmul_symmetric_buffer(self, x):
+        """Get the existing TP workspace shaped for this linear's output."""
         use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
         symm_mem_buffer_dims = list(x.size())
         if use_mxfp8:
@@ -469,7 +464,16 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             del symm_mem_buffer_dims[1]
         symm_mem_buffer_dims[-1] = self.weight.size(0)
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
-        symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
+        return buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
+
+    def _matmul_reduce_scatter(self, x, residual=None):
+        """
+        Multiplies x by the weight matrix and performs a reduce-scatter.
+        It will first try to write the matmul output to symmetric memory
+        and perform an NVLS multicast reduce-scatter. If that is not possible,
+        it will revert to torch.dist (NCCL) reduce-scatter.
+        """
+        symm_mem_buffer = self._matmul_symmetric_buffer(x)
 
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
@@ -547,8 +551,20 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             x = _apply_linear(x, self.weight, self.config)
             return x, None
         elif not self.sequence_parallel:
-            x = _apply_linear(x, self.weight, self.config)
-            return self.replicated_reduce(x), None
+            buffer = {"handle": None}
+            if self.replicated_reduce.kernel is not None and not is_batch_invariant_mode_enabled():
+                buffer = self._matmul_symmetric_buffer(x)
+            output = (
+                buffer["tensor"]
+                if buffer["handle"] is not None
+                and x.dtype in (torch.bfloat16, torch.float32)
+                and are_tensors_nvls_eligible(buffer["tensor"])
+                else None
+            )
+            # Match the SP path: GEMM publishes directly into the TP workspace,
+            # avoiding an additional copy kernel before the reduction.
+            x = _apply_linear(x, self.weight, self.config, out=output)
+            return self.replicated_reduce(x, buffer=buffer if output is not None else None), None
         else:
             x = self._matmul_reduce_scatter(x)
             return x, None

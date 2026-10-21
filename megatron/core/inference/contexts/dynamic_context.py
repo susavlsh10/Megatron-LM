@@ -438,7 +438,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self.batch_invariant_mode = model_config.batch_invariant_mode
         self.nemo_parallel = inference_config.nemo_parallel
-        self.token_alignment = self.nemo_parallel.alignment if self.nemo_parallel else tp_size
+        self.token_alignment = (
+            self.nemo_parallel.alignment
+            if self.nemo_parallel
+            else (tp_size if model_config.sequence_parallel else 1)
+        )
         if self.nemo_parallel is not None:
             if inference_config.num_speculative_tokens or inference_config.enable_prefix_caching:
                 raise ValueError(
@@ -899,9 +903,18 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self._nccl_ep_dispatcher:
             NCCLAllGatherDispatcher.allocate_buffers()
         elif (
-            not model_config.sequence_parallel
+            model_config.inference_moe_token_dispatcher_type == 'nvls'
             and get_pg_size(self.expert_model_parallel_group) == 1
-            and model_config.inference_moe_token_dispatcher_type == 'nvls'
+            and (
+                get_pg_size(self.expert_tensor_and_model_parallel_group) == 1
+                or (
+                    not model_config.sequence_parallel
+                    and (
+                        self.nemo_parallel is not None
+                        or get_pg_size(self.expert_tensor_and_model_parallel_group) == tp_size
+                    )
+                )
+            )
         ):
             # Replicated expert TP and singleton inference use no AGV/RSV scratch.
             NVLSAllGatherVDispatcher._delete_buffers()

@@ -76,11 +76,31 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     def __init__(self, *args, runs_metadata_sync: bool = True, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._runs_metadata_sync = runs_metadata_sync
-        self.replicated_input = not self.config.sequence_parallel and self.ep_size == 1
-        if not self.config.sequence_parallel and self.tp_size > 1 and self.ep_size > 1:
-            raise ValueError("Replicated inference routing currently requires EP=1")
+        groups = kwargs.get("pg_collection")
+        dense_tp_size = (
+            get_pg_size(groups.tp) if groups is not None else self.config.tensor_model_parallel_size
+        )
+        self.replicated_input = (
+            not self.config.sequence_parallel
+            and self.ep_size == 1
+            and self.tp_size == dense_tp_size
+            and (
+                groups is None
+                or self.tp_ep_group is groups.tp
+                or set(dist.get_process_group_ranks(self.tp_ep_group))
+                == set(dist.get_process_group_ranks(groups.tp))
+            )
+        )
+        if not self.config.sequence_parallel and dense_tp_size > 1 and not self.replicated_input:
+            raise ValueError("Replicated inference requires matching dense/expert TP and EP=1")
+        if self.replicated_input and self.tp_size > 1 and self.config.moe_shared_expert_overlap:
+            raise ValueError("Replicated expert TP does not support shared-expert overlap")
         self.replicated_reduce = (
-            InferenceAllReduce(self.tp_ep_group, self.config.inference_disable_triton_nvls_kernels)
+            InferenceAllReduce(
+                self.tp_ep_group,
+                self.config.inference_disable_triton_nvls_kernels
+                or self.config.inference_moe_token_dispatcher_type == "nccl",
+            )
             if self.replicated_input
             else None
         )
