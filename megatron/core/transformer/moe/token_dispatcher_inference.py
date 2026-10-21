@@ -28,6 +28,7 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
+from megatron.core.inference.communication.all_reduce import InferenceAllReduce
 from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
@@ -75,6 +76,14 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     def __init__(self, *args, runs_metadata_sync: bool = True, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._runs_metadata_sync = runs_metadata_sync
+        self.replicated_input = not self.config.sequence_parallel and self.ep_size == 1
+        if not self.config.sequence_parallel and self.tp_size > 1 and self.ep_size > 1:
+            raise ValueError("Replicated inference routing currently requires EP=1")
+        self.replicated_reduce = (
+            InferenceAllReduce(self.tp_ep_group, self.config.inference_disable_triton_nvls_kernels)
+            if self.replicated_input
+            else None
+        )
 
     @classmethod
     def _valid_tokens(cls) -> torch.Tensor:
@@ -272,6 +281,9 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         Returns:
             [local_tokens, hidden_dim] bf16 local token outputs.
         """
+        if self.replicated_input:
+            tokens = self.hidden_shape.numel() // self.hidden_shape[-1]
+            return self.replicated_reduce(hidden_states[:tokens]).to(torch.bfloat16)
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
@@ -513,7 +525,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Rank inside pg_collection.tp — the *standard* TP group that SP shards
         # the routing map along. Base class self.tp_rank is the expt_tp rank,
         # which is not what we want for the SP padding offset.
-        self.sp_rank = get_pg_rank(pg_collection.tp)
+        self.sp_rank = 0 if self.replicated_input else get_pg_rank(pg_collection.tp)
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
         # When shared_expert_overlap is enabled, the shared expert forward is launched
@@ -583,7 +595,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
             )
 
-        if self.tp_size * self.ep_size == 1:
+        if self.replicated_input or self.tp_size * self.ep_size == 1:
             if self._runs_metadata_sync:
                 InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
                 # local_tokens * ep_size, with ep_size == 1. Set explicitly
@@ -654,6 +666,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
         """
+        if self.replicated_input:
+            return self.replicated_reduce(hidden_states[: self._local_tokens]).to(torch.bfloat16)
         if self.tp_size * self.ep_size == 1:
             # Fused experts may return padded scratch even without a collective.
             return hidden_states[: self._local_tokens].to(torch.bfloat16)

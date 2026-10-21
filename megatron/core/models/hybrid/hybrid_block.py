@@ -440,6 +440,15 @@ class HybridStack(MegatronModule):
         ]
 
         if self.nemo_parallel is not None:
+            if self.nemo_parallel.mode == "persistent":
+                for index, layer in enumerate(self.layers):
+                    if isinstance(layer, ShortcutMoEBlock):
+                        layer.nemo_input_branch = index > 0 and isinstance(
+                            self.layers[index - 1], ShortcutMoEBlock
+                        )
+                        layer.nemo_output_branch = index + 1 < len(self.layers) and isinstance(
+                            self.layers[index + 1], ShortcutMoEBlock
+                        )
             self.nemo_parallel.register_layers(self.physical_layers(), self.layer_type_list)
 
     def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:

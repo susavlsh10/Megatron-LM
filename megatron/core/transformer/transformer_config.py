@@ -847,6 +847,9 @@ class TransformerConfig(ModelParallelConfig):
     The expert pool uses the remaining ranks of the model TP group.
     """
 
+    inference_nemo_parallel_join: str = "fork"
+    """Shortcut boundary layout: fork (full SP), persistent (branch SP), or replicated."""
+
     inference_nemo_parallel_role: Optional[str] = field(default=None, init=False, repr=False)
     """Internal branch ownership assigned at model construction."""
 

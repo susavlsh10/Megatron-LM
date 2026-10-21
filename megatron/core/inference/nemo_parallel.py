@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.distributed as dist
 
+from megatron.core.inference.communication.all_reduce import InferenceAllReduce
 from megatron.core.inference.communication.torch_symm_triton.collectives import (
     multimem_all_gather,
     multimem_reduce_scatter,
@@ -36,6 +37,8 @@ class NemoParallel:
     mixer_size: int
     expert_size: int
     is_mixer: bool
+    mode: str = "fork"
+    join_reduce: object = field(default=None, repr=False)
     state_shapes: dict = field(default_factory=dict)
     attention_heads: dict = field(default_factory=dict)
     model_state_shapes: dict = field(default_factory=dict)
@@ -58,8 +61,13 @@ class NemoParallel:
             raise ValueError("Nemo Parallel TP currently requires CP=PP=EP=1")
         if full.gtp_remat.size() != 1 or full.expt_gtp_remat.size() != 1:
             raise ValueError("Nemo Parallel currently requires ordinary TP without weight remat")
-        if not config.sequence_parallel or config.transformer_impl != "inference_optimized":
-            raise ValueError("Nemo Parallel requires sequence-parallel optimized inference")
+        mode = getattr(config, "inference_nemo_parallel_join", "fork")
+        if mode not in ("fork", "persistent", "replicated"):
+            raise ValueError("Unknown Nemo Parallel join layout")
+        if config.sequence_parallel != (mode != "replicated"):
+            raise ValueError("Only the replicated Nemo layout disables sequence parallelism")
+        if config.transformer_impl != "inference_optimized":
+            raise ValueError("Nemo Parallel requires optimized inference")
         if not config.moe_shortcut_connection or config.inference_shortcut_moe_overlap:
             raise ValueError("Nemo Parallel requires shortcut pairs without same-GPU overlap")
         if config.fp8 or config.fp4 or not config.bf16:
@@ -86,7 +94,19 @@ class NemoParallel:
         # expert-DP coordinates of the outer, uniformly partitioned topology.
         branch.expt_dp = full.dp
         branch.expt_dp_gtp_remat = full.dp_gtp_remat
-        return cls(full, branch, mixer_size, expert_size, is_mixer)
+        return cls(
+            full,
+            branch,
+            mixer_size,
+            expert_size,
+            is_mixer,
+            mode=mode,
+            join_reduce=(
+                InferenceAllReduce(full.tp, config.inference_disable_triton_nvls_kernels)
+                if mode != "fork"
+                else None
+            ),
+        )
 
     def register_layers(self, layers, layer_types):
         """Record cache requirements from the actual locally owned modules."""
@@ -131,8 +151,10 @@ class NemoParallel:
                 "nemo_join", self.full.tp, size_mb=math.ceil(size_bytes / (1024 * 1024))
             )
 
-    def fork(self, hidden, config):
+    def fork(self, hidden, config, already_branch=False):
         """Full-group SP -> branch SP, preserving global token order."""
+        if self.mode == "replicated" or already_branch:
+            return hidden
         shape = (hidden.shape[0] * self.full.tp.size(), *hidden.shape[1:])
         buffer = (
             self.fork_buffer.maybe_get_tensor(shape, hidden.dtype)
@@ -153,7 +175,7 @@ class NemoParallel:
         start = self.branch.tp.rank() * count
         return gathered.narrow(0, start, count).contiguous()
 
-    def join(self, update, residual, residual_width, config):
+    def join(self, update, residual, residual_width, config, branch_output=False):
         """Join completed branches and return full-group SP output and mixer residual.
 
         Every token has one shared contribution, one routed contribution, and
@@ -161,7 +183,7 @@ class NemoParallel:
         the branch sum is rounded back to the model dtype before normalization.
         """
         local_tokens = update.shape[0]
-        tokens = local_tokens * self.branch.tp.size()
+        tokens = local_tokens * (1 if self.mode == "replicated" else self.branch.tp.size())
         shape = (tokens, *update.shape[1:-1], residual_width + update.shape[-1])
         output_shape = (tokens // self.full.tp.size(), *shape[1:])
         buffer = (
@@ -176,12 +198,18 @@ class NemoParallel:
             payload = buffer["tensor"].zero_()
         else:
             payload = torch.zeros(shape, dtype=torch.float32, device=update.device)
-        start = self.branch.tp.rank() * local_tokens
+        start = 0 if self.mode == "replicated" else self.branch.tp.rank() * local_tokens
         target = payload.narrow(0, start, local_tokens)
-        if residual is not None:
-            target[..., :residual_width].copy_(residual)
-        target[..., residual_width:].copy_(update)
-        if use_nvls:
+        # Replicated branch results have one owner, independently of pool sizes.
+        if self.mode != "replicated" or self.branch.tp.rank() == 0:
+            if residual is not None:
+                target[..., :residual_width].copy_(residual)
+            target[..., residual_width:].copy_(update)
+        if self.mode == "replicated" or branch_output:
+            joined = self.join_reduce(payload, buffer=buffer)
+            if branch_output:
+                joined = joined.narrow(0, start, local_tokens)
+        elif use_nvls:
             joined = torch.empty(output_shape, dtype=torch.float32, device=update.device)
             multimem_reduce_scatter(joined, payload, buffer["handle"])
         else:
@@ -203,7 +231,7 @@ def forward_shortcut_pair(
     plan = block.nemo_parallel
     if block.training or context is None or not context.is_dynamic_batching():
         raise RuntimeError("Nemo Parallel is only supported in dynamic inference")
-    hidden = plan.fork(hidden, block.config)
+    hidden = plan.fork(hidden, block.config, getattr(block, "nemo_input_branch", False))
     residual_width = hidden.shape[-1]
     if plan.is_mixer:
         computed = block._forward_compute_atomic(
@@ -235,7 +263,13 @@ def forward_shortcut_pair(
         update = block._launch_combine(update)
         update = block.moe_layer.mlp.routed_experts_postprocess(update)
         residual = None
-    update, residual = plan.join(update, residual, residual_width, block.config)
+    update, residual = plan.join(
+        update,
+        residual,
+        residual_width,
+        block.config,
+        branch_output=getattr(block, "nemo_output_branch", False),
+    )
     residual = residual.to(torch.float32 if block.config.fp32_residual_connection else hidden.dtype)
     # Residual connection state is architecture-owned. Reuse its read contract rather
     # than assuming a particular wide-residual or ordinary residual representation.

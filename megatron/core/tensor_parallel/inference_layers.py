@@ -10,6 +10,7 @@ from megatron.core.extensions.transformer_engine import (
     TELinear,
     TERowParallelLinear,
 )
+from megatron.core.inference.communication.all_reduce import InferenceAllReduce
 from megatron.core.inference.communication.torch_symm_triton import (
     are_tensors_nvls_eligible,
     fused_multimem_rs_add_norm_ag,
@@ -175,10 +176,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
 
         self.eps = config.layernorm_epsilon
 
-        if self.tp_size > 1:
-            assert (
-                config.sequence_parallel
-            ), "--transformer-impl=inference_optimized requires --sequence-parallel"
+        self.sequence_parallel = config.sequence_parallel
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
@@ -218,7 +216,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         Attempt an NVLS all-gather into symmetric memory. If not possible,
         revert to torch dist (NCCL) all-gather.
         """
-        if self.tp_size == 1:
+        if self.tp_size == 1 or not self.sequence_parallel:
             return x
 
         # Check input only: if input is 16-byte divisible, the output
@@ -256,7 +254,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if self.training:
             return super().forward(x)
 
-        if self.tp_size == 1:
+        if self.tp_size == 1 or not self.sequence_parallel:
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = _apply_linear(x, self.weight, self.config)
             return x, None
@@ -325,10 +323,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             output_size % self.tp_size == 0
         ), f"output_size ({output_size}) must be divisible by tp_size ({self.tp_size})"
 
-        if self.tp_size > 1:
-            assert (
-                config.sequence_parallel
-            ), "--transformer-impl=inference_optimized requires --sequence-parallel"
+        self.sequence_parallel = config.sequence_parallel
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
@@ -362,7 +357,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         Attempt an NVLS all-gather into symmetric memory. If not possible,
         revert to torch dist (NCCL) all-gather.
         """
-        if self.tp_size == 1:
+        if self.tp_size == 1 or not self.sequence_parallel:
             return x
 
         can_use_nvls = (
@@ -391,7 +386,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         if self.training:
             return super().forward(x)
 
-        if self.tp_size == 1:
+        if self.tp_size == 1 or not self.sequence_parallel:
             x = _apply_linear(x, self.weight, self.config)
             return x, None
 
@@ -444,10 +439,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             input_size % self.tp_size == 0
         ), f"input_size ({input_size}) must be divisible by tp_size ({self.tp_size})"
 
-        if self.tp_size > 1:
-            assert (
-                config.sequence_parallel
-            ), "--transformer-impl=inference_optimized requires --sequence-parallel"
+        self.sequence_parallel = config.sequence_parallel
 
         self.triton_nvls_kernels_allowed = not getattr(
             config, 'inference_disable_triton_nvls_kernels', False
@@ -457,6 +449,11 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # reduce-scatter + add + rms-norm + all-gather
         self.next_layer_norm_weights = None
         self.config = config
+        self.replicated_reduce = (
+            InferenceAllReduce(self.tp_group, not self.triton_nvls_kernels_allowed)
+            if not config.sequence_parallel
+            else None
+        )
 
     def _matmul_reduce_scatter(self, x, residual=None):
         """
@@ -549,6 +546,9 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         if self.tp_size == 1:
             x = _apply_linear(x, self.weight, self.config)
             return x, None
+        elif not self.sequence_parallel:
+            x = _apply_linear(x, self.weight, self.config)
+            return self.replicated_reduce(x), None
         else:
             x = self._matmul_reduce_scatter(x)
             return x, None

@@ -898,6 +898,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
         if self._nccl_ep_dispatcher:
             NCCLAllGatherDispatcher.allocate_buffers()
+        elif (
+            not model_config.sequence_parallel
+            and get_pg_size(self.expert_model_parallel_group) == 1
+            and model_config.inference_moe_token_dispatcher_type == 'nvls'
+        ):
+            # Replicated expert TP and singleton inference use no AGV/RSV scratch.
+            NVLSAllGatherVDispatcher._delete_buffers()
         elif self._nvls_dispatcher:
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
@@ -910,7 +917,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 hidden_size=moe_hidden_size,
                 tp_ep_group=self.expert_tensor_and_model_parallel_group,
             )
-
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
         # inside CUDA graph capture; one buffer set is shared by all MoE layers
         # and graphs. Like the dispatcher buffers above, these persist across

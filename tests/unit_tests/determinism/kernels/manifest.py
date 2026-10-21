@@ -340,6 +340,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="moe_token_dispatchers",
         sources=(
             "megatron/core/transformer/moe/token_dispatcher.py",
+            "megatron/core/transformer/moe/token_dispatcher_inference.py",
             "megatron/core/transformer/moe/moe_layer.py",
         ),
         tests=(K + "test_moe_kernels.py", K + "test_nemo_parallel.py"),
@@ -616,7 +617,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="inference_nemo_parallel_layouts",
-        sources=("megatron/core/inference/nemo_parallel.py",),
+        sources=(
+            "megatron/core/inference/nemo_parallel.py",
+            "megatron/core/ops/communication/nvls_all_reduce.py",
+            "megatron/core/inference/communication/all_reduce.py",
+        ),
         tests=(K + "test_nemo_parallel.py",),
         kind="torch-op",
         training_path=False,
