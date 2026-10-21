@@ -655,7 +655,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             [local_tokens, hidden_size] bf16 local token outputs.
         """
         if self.tp_size * self.ep_size == 1:
-            return hidden_states.to(torch.bfloat16)
+            # Fused experts may return padded scratch even without a collective.
+            return hidden_states[: self._local_tokens].to(torch.bfloat16)
 
         rsv = self.__class__._symm_rsv
 

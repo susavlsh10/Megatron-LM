@@ -699,20 +699,19 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.block_size_bytes + mamba_states_memory_per_request
             )
 
-        # If using pipeline parallelism synchronize the total block count in case the
-        # pipeline stages have different layer allocations. Non-uniform block counts
-        # can lead to some ranks pausing requests earlier than other ranks
-        # (i.e., divergence in the scheduling behavior).
-        if pp_size > 1:
+        # Different stage/pool cache footprints must not change request admission
+        # within one replica. Reuse the PP capacity consensus for the branch pools.
+        cache_sync_group = (
+            self.nemo_parallel.full.tp if self.nemo_parallel else self.pipeline_parallel_group
+        )
+        if pp_size > 1 or self.nemo_parallel is not None:
             block_count_tensor = torch.tensor(
                 (block_count, paused_block_count),
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
             torch.distributed.all_reduce(
-                block_count_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.pipeline_parallel_group,
+                block_count_tensor, op=torch.distributed.ReduceOp.MIN, group=cache_sync_group
             )
             block_count = block_count_tensor[0].item()
             paused_block_count = block_count_tensor[1].item()
@@ -1158,9 +1157,19 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     )
                     for layer, shapes in self.nemo_parallel.state_shapes.items()
                 }
-                first_conv, first_ssm = next(iter(self._nemo_states.values()))
-                self.mamba_conv_states = first_conv.unsqueeze(0)
-                self.mamba_ssm_states = first_ssm.unsqueeze(0)
+                # These attributes provide device/lifecycle metadata. Actual cache
+                # lookups use the per-layer dictionary, which can be empty on experts.
+                if self._nemo_states:
+                    first_conv, first_ssm = next(iter(self._nemo_states.values()))
+                    self.mamba_conv_states = first_conv.unsqueeze(0)
+                    self.mamba_ssm_states = first_ssm.unsqueeze(0)
+                else:
+                    self.mamba_conv_states = torch.empty(
+                        (0,), dtype=self.mamba_conv_states_dtype, device="cuda"
+                    )
+                    self.mamba_ssm_states = torch.empty(
+                        (0,), dtype=self.mamba_ssm_states_dtype, device="cuda"
+                    )
             else:
                 self.mamba_conv_states = torch.empty(
                     (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,

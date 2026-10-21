@@ -123,7 +123,12 @@ class MambaInferenceStateConfig:
             # extraction offsets). A future cross-rank consumer must reconcile
             # these across the PP group.
             # Align layers with layer_type_list (Shortcut-MoE registers each pair as one module).
-            chunking = ssm_chunking(decoder.layer_type_list, decoder.physical_layers())
+            plan = getattr(decoder, "nemo_parallel", None)
+            chunking = (
+                plan.model_chunking
+                if plan is not None
+                else ssm_chunking(decoder.layer_type_list, decoder.physical_layers())
+            )
             if chunking is None:
                 mamba_chunk_size = 128
                 ssm_chunk_alignment = mamba_chunk_size

@@ -440,7 +440,7 @@ class HybridStack(MegatronModule):
         ]
 
         if self.nemo_parallel is not None:
-            self.nemo_parallel.register_layers(self.physical_layers())
+            self.nemo_parallel.register_layers(self.physical_layers(), self.layer_type_list)
 
     def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:
         """Return physical layer indices that must share one residual replay block."""
@@ -518,7 +518,8 @@ class HybridStack(MegatronModule):
         if self.nemo_parallel is not None:
             import math
 
-            shapes = list(self.nemo_parallel.state_shapes.values())
+            # Budget one logical replica; allocate only the locally owned layers.
+            shapes = list(self.nemo_parallel.model_state_shapes.values())
             if not shapes:
                 return None
             return (

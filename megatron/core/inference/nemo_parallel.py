@@ -38,6 +38,8 @@ class NemoParallel:
     is_mixer: bool
     state_shapes: dict = field(default_factory=dict)
     attention_heads: dict = field(default_factory=dict)
+    model_state_shapes: dict = field(default_factory=dict)
+    model_chunking: object = None
     fork_buffer: object = field(default=None, repr=False)
     join_buffer: object = field(default=None, repr=False)
 
@@ -86,7 +88,7 @@ class NemoParallel:
         branch.expt_dp_gtp_remat = full.dp_gtp_remat
         return cls(full, branch, mixer_size, expert_size, is_mixer)
 
-    def register_layers(self, layers):
+    def register_layers(self, layers, layer_types):
         """Record cache requirements from the actual locally owned modules."""
         for index, layer in enumerate(layers):
             if layer is None:
@@ -102,6 +104,15 @@ class NemoParallel:
                 shapes = method()
                 if shapes is not None:
                     self.state_shapes[index] = shapes
+        from megatron.core.ssm.ssm_inference import ssm_chunking
+
+        # Mixer ranks own every mixer, including the unpaired layers. All ranks
+        # need its logical layout even when the expert pool owns no recurrent state.
+        layout = [(self.state_shapes, ssm_chunking(layer_types, layers)) if self.is_mixer else None]
+        dist.broadcast_object_list(
+            layout, src=dist.get_process_group_ranks(self.full.tp)[0], group=self.full.tp
+        )
+        self.model_state_shapes, self.model_chunking = layout[0]
 
     def layer_config(self, config):
         result = copy(config)

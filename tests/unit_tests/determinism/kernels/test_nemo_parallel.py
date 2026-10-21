@@ -3,6 +3,7 @@
 """Distributed layout and graph-replay contracts for shortcut branch placement."""
 
 from copy import copy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -107,6 +108,7 @@ def test_hybrid_checkpoint_resharding_and_caches(tmp_path):
     from megatron.core.inference.sampling_params import SamplingParams
     from megatron.core.inference.utils import InferenceMode
     from megatron.core.models.hybrid.hybrid_layer_specs import (
+        gated_delta_product_inference_stack_spec,
         wide_residual_gated_delta_product_inference_stack_spec,
     )
     from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -156,21 +158,25 @@ def test_hybrid_checkpoint_resharding_and_caches(tmp_path):
         )
         groups = ProcessGroupCollection.use_mpu_process_groups()
 
-        def build(model_config):
+        def build(model_config, pattern):
             return (
                 HybridModel(
                     config=model_config,
-                    hybrid_stack_spec=wide_residual_gated_delta_product_inference_stack_spec,
+                    hybrid_stack_spec=(
+                        wide_residual_gated_delta_product_inference_stack_spec
+                        if model_config.wide_residual is not None
+                        else gated_delta_product_inference_stack_spec
+                    ),
                     vocab_size=128,
                     max_sequence_length=64,
-                    hybrid_layer_pattern="MEM*E*-",
+                    hybrid_layer_pattern=pattern,
                     pg_collection=groups,
                 )
                 .cuda()
                 .eval()
             )
 
-        def make_context(model):
+        def make_context(model, alignment):
             return DynamicInferenceContext(
                 model.config,
                 InferenceConfig(
@@ -178,12 +184,13 @@ def test_hybrid_checkpoint_resharding_and_caches(tmp_path):
                     nemo_parallel=model.decoder.nemo_parallel,
                     mamba_inference_state_config=MambaInferenceStateConfig.from_model(model),
                     max_sequence_length=64,
-                    max_requests=4,
-                    max_tokens=64,
+                    max_requests=alignment,
+                    max_tokens=alignment * 16,
                     buffer_size_gb=0.0625,
                     block_size_tokens=256,
                     num_cuda_graphs=None,
                     use_flashinfer_fused_rope=False,
+                    materialize_only_last_token_logits=False,
                 ),
             )
 
@@ -206,46 +213,84 @@ def test_hybrid_checkpoint_resharding_and_caches(tmp_path):
                     runtime_gather_output=True,
                 ).clone()
 
-        baseline_config = copy(config)
-        baseline_config.inference_nemo_parallel_mixer_tp_size = 0
-        baseline = build(baseline_config)
-        reference = forward(baseline, make_context(baseline))
         paths = [str(tmp_path)]
         torch.distributed.broadcast_object_list(paths, src=0)
-        dist_checkpointing.save(baseline.sharded_state_dict(), paths[0])
-        model = build(config)
-        model.load_state_dict(dist_checkpointing.load(model.sharded_state_dict(), paths[0]))
-        from megatron.core.dist_checkpointing.mapping import apply_factories
-        from megatron.core.dist_checkpointing.validation import (
-            determine_global_metadata,
-            validate_sharding_integrity,
-        )
+        template = config
+        for case, pattern in enumerate(("MEM*E*-", "ME*E-", "ME*E-")):
+            model_parallel_cuda_manual_seed(1234 + case)
+            config = copy(template)
+            config.num_layers = len(pattern)
+            if case == 2:
+                # A dimension-compatible 3+1 layout exercises real NCCL mixer TP
+                # and a single-GPU expert path, not just activation redistribution.
+                config.inference_nemo_parallel_mixer_tp_size = 3
+                config.wide_residual = None
+                config.hidden_size = 192
+                config.num_attention_heads = config.num_query_groups = 12
+                config.kv_channels = 16
+                config.mamba_num_heads = 24
+                config.mamba_num_groups = 12
+                config.ffn_hidden_size = config.moe_ffn_hidden_size = 192
+                config.moe_shared_expert_intermediate_size = 192
+            baseline_config = copy(config)
+            baseline_config.inference_nemo_parallel_mixer_tp_size = 0
+            baseline = build(baseline_config, pattern)
+            alignment = 12 if case == 2 else 4
+            reference = forward(baseline, make_context(baseline, alignment))
+            checkpoint_dir = Path(paths[0]) / str(case)
+            checkpoint_dir.mkdir(exist_ok=True)
+            dist_checkpointing.save(baseline.sharded_state_dict(), checkpoint_dir)
+            model = build(config, pattern)
+            model.load_state_dict(
+                dist_checkpointing.load(model.sharded_state_dict(), checkpoint_dir)
+            )
+            from megatron.core.dist_checkpointing.mapping import apply_factories
+            from megatron.core.dist_checkpointing.validation import (
+                determine_global_metadata,
+                validate_sharding_integrity,
+            )
 
-        checkpoint_state = model.sharded_state_dict()
-        apply_factories(checkpoint_state)
-        _, global_metadata = determine_global_metadata(checkpoint_state)
-        validate_sharding_integrity(global_metadata)
-        plan = model.decoder.nemo_parallel
-        pair = model.decoder.layers[0]
-        assert (pair.compute_layer is not None) == plan.is_mixer
-        assert (pair.moe_layer.mlp.experts is None) == plan.is_mixer
-        assert (pair.moe_layer.mlp.shared_experts is not None) == plan.is_mixer
-        context = make_context(model)
-        assert set(plan.state_shapes) == ({0, 2} if plan.is_mixer else {2})
-        for layer, (conv_shape, ssm_shape) in plan.state_shapes.items():
-            conv, ssm = context.mamba_states_cache(layer + 1)
-            assert conv.shape == (4, *conv_shape) and ssm.shape == (4, *ssm_shape)
-            assert conv.is_contiguous() and ssm.is_contiguous()
-            conv.fill_(1)
-            ssm.fill_(1)
-        context._pending_mamba_zeros.append(0)
-        context._execute_pending_mamba_ops()
-        for layer in plan.state_shapes:
-            conv, ssm = context.mamba_states_cache(layer + 1)
-            assert torch.all(conv[0] == 0) and torch.all(ssm[0] == 0)
-            assert torch.all(conv[1] == 1) and torch.all(ssm[1] == 1)
-        logits = forward(model, context)
-        torch.testing.assert_close(logits, reference, atol=0.01, rtol=0.05)
+            checkpoint_state = model.sharded_state_dict()
+            apply_factories(checkpoint_state)
+            _, global_metadata = determine_global_metadata(checkpoint_state)
+            validate_sharding_integrity(global_metadata)
+            plan = model.decoder.nemo_parallel
+            pair = model.decoder.layers[0]
+            assert (pair.compute_layer is not None) == plan.is_mixer
+            assert (pair.moe_layer.mlp.experts is None) == plan.is_mixer
+            assert (pair.moe_layer.mlp.shared_experts is not None) == plan.is_mixer
+            context = make_context(model, alignment)
+            mixer_states = {0, 2} if case == 0 else {0}
+            expert_states = {2} if case == 0 else set()
+            assert set(plan.state_shapes) == (mixer_states if plan.is_mixer else expert_states)
+            assert context.is_hybrid_model and context.gdp_num_householder == 2
+            limits = [None] * 4
+            torch.distributed.all_gather_object(
+                limits,
+                (
+                    context.kv_block_allocator.pool_size,
+                    context.max_requests,
+                    context.mamba_chunk_size,
+                ),
+            )
+            assert all(limit == limits[0] for limit in limits)
+            assert set(context._nemo_states) == set(plan.state_shapes)
+            for layer, (conv_shape, ssm_shape) in plan.state_shapes.items():
+                conv, ssm = context.mamba_states_cache(layer + 1)
+                assert conv.shape == (context.max_requests, *conv_shape)
+                assert ssm.shape == (context.max_requests, *ssm_shape)
+                assert conv.is_contiguous() and ssm.is_contiguous()
+                conv.fill_(1)
+                ssm.fill_(1)
+            context._pending_mamba_zeros.append(0)
+            context._execute_pending_mamba_ops()
+            for layer in plan.state_shapes:
+                conv, ssm = context.mamba_states_cache(layer + 1)
+                assert torch.all(conv[0] == 0) and torch.all(ssm[0] == 0)
+                assert torch.all(conv[1] == 1) and torch.all(ssm[1] == 1)
+            logits = forward(model, context)
+            # TP layouts can pad to different token counts; compare the real prompt.
+            torch.testing.assert_close(logits[:, :8], reference[:, :8], atol=0.01, rtol=0.05)
     finally:
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
