@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.ops._backends import require
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -217,6 +223,28 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             if wr.learned_retention
             else None
         )
+        self._inference_read_rmsnorm = None
+        if (
+            config.transformer_impl == "inference_optimized"
+            and config.params_dtype == torch.bfloat16
+            and not config.fp8
+            and not config.fp4
+            and not config.deterministic_mode
+        ):
+            kernels = require(
+                "megatron.core.ops.residual.streamwise",
+                "streamwise_read_rmsnorm",
+                needed_by="Streamwise residual inference fusion",
+            )
+            self._inference_read_rmsnorm = kernels.streamwise_read_rmsnorm
+
+    def prepare_write_state(
+        self, hidden_states: Tensor, *, fp32_residual_connection: bool = False
+    ) -> ResidualConnectionState:
+        """Streamwise writes need only the carried residual, independent of the read."""
+        if hidden_states.shape[-1] != self.residual_stream_hidden_size:
+            raise ValueError("Unexpected residual-stream width while preparing write state.")
+        return (hidden_states.float() if fp32_residual_connection else hidden_states,)
 
     def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
         return (
@@ -379,6 +407,19 @@ class WideResidualTransformerLayer(TransformerLayer):
         self.residual_stream_hidden_size = (
             config.wide_residual.num_streams * self.config.hidden_size
         )
+        self._fused_input_norm = self._fused_mlp_norm = False
+        if any(
+            connection._inference_read_rmsnorm is not None for connection in residual_connections
+        ) and not any(
+            os.environ.get(name, "0") != "0"
+            for name in ("NVTE_NORM_FWD_USE_CUDNN", "NVTE_NORM_USE_CUDNN", "NVTE_USE_CUDNN_RMSNORM")
+        ):
+            norm_type = require(
+                "transformer_engine.pytorch", "RMSNorm", needed_by="Streamwise read RMSNorm"
+            ).RMSNorm
+            # Custom norm classes retain their forward methods and output contracts.
+            self._fused_input_norm = type(self.input_layernorm) is norm_type
+            self._fused_mlp_norm = type(self.pre_mlp_layernorm) is norm_type
         for connection in residual_connections:
             if connection.residual_stream_hidden_size != self.residual_stream_hidden_size:
                 raise ValueError(
@@ -392,6 +433,71 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"hidden_size={self.config.hidden_size}, got "
                     f"{connection.branch_hidden_size}."
                 )
+
+    def _inference_read_norm(self, hidden_states, connection, norm):
+        """Fuse small inference reads; retain training, replay, and large-prefill paths."""
+        if (
+            connection is None
+            or connection._inference_read_rmsnorm is None
+            or self.training
+            or torch.is_grad_enabled()
+            or not InferenceMode.is_active()
+            or is_batch_invariant_mode_enabled()
+            or not hidden_states.is_cuda
+            or not hidden_states.is_contiguous()
+            or hidden_states.numel() // hidden_states.shape[-1] > 64
+            or norm.weight.numel() > 8192
+        ):
+            return None
+        output = connection._inference_read_rmsnorm(
+            hidden_states,
+            connection.read_map(return_logits=True),
+            norm.weight,
+            connection.num_streams,
+            norm.eps,
+            norm.zero_centered_gamma,
+        )
+        state = connection.prepare_write_state(
+            hidden_states, fp32_residual_connection=self.config.fp32_residual_connection
+        )
+        return output, connection.residual_stream(state), state
+
+    def _run_input_layernorm(
+        self, hidden_states, mhc_recompute_manager=None, residual_stream_recompute_context=None
+    ):
+        if (
+            self._fused_input_norm
+            and mhc_recompute_manager is None
+            and residual_stream_recompute_context is None
+        ):
+            result = self._inference_read_norm(
+                hidden_states, self.residual_connection_self_attn, self.input_layernorm
+            )
+            if result is not None:
+                self.attn_norm_manager = self.off_interface(False, hidden_states, "attn_norm")
+                self._input_layernorm_checkpoint_active = False
+                return result
+        return super()._run_input_layernorm(
+            hidden_states, mhc_recompute_manager, residual_stream_recompute_context
+        )
+
+    def _pre_mlp_layernorm_and_residual(
+        self, hidden_states, mhc_recompute_manager=None, residual_stream_recompute_context=None
+    ):
+        if (
+            self._fused_mlp_norm
+            and mhc_recompute_manager is None
+            and residual_stream_recompute_context is None
+        ):
+            result = self._inference_read_norm(
+                hidden_states, self.residual_connection_mlp, self.pre_mlp_layernorm
+            )
+            if result is not None:
+                self.mlp_norm_manager = self.off_interface(False, hidden_states, "mlp_norm")
+                return result
+        return super()._pre_mlp_layernorm_and_residual(
+            hidden_states, mhc_recompute_manager, residual_stream_recompute_context
+        )
 
     def _get_self_attention_residual_connection(self) -> ResidualConnection | None:
         """Return the connection surrounding the self-attention branch."""

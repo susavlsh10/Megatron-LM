@@ -15,6 +15,58 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.parametrize("disable_nvls", [False, True])
+@pytest.mark.parametrize("width,split", [(12, 3), (12288, 9216)])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_all_reduce_split_cast_graph_replay(disable_nvls, width, split, output_dtype):
+    """Fused stores preserve the original reduction/cast and contiguous output layouts."""
+    from megatron.core.inference.communication.all_reduce import InferenceAllReduce
+
+    if Utils.world_size != 4:
+        pytest.skip("This collective regression uses four ranks")
+    Utils.initialize_model_parallel(4, 1)
+    try:
+        group = ProcessGroupCollection.use_mpu_process_groups().tp
+        reduce = InferenceAllReduce(group, disable_nvls)
+        generator = torch.Generator(device="cuda").manual_seed(217 + Utils.rank)
+        x = torch.randn(32, 1, width, device="cuda", generator=generator)
+        count = 8 * (Utils.rank + 1)
+        start = 0 if Utils.rank == 3 else Utils.rank * 4
+
+        def run():
+            return reduce(
+                x,
+                output_start=start,
+                output_tokens=count,
+                output_dtype=output_dtype,
+                output_split=split,
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            left, right = run()
+        for _ in range(3):
+            x.normal_(generator=generator)
+            graph.replay()
+            expected = reduce(x).narrow(0, start, count).to(output_dtype)
+            converted = reduce(
+                x, output_start=start, output_tokens=count, output_dtype=output_dtype
+            )
+            torch.testing.assert_close(converted, expected, atol=0, rtol=0)
+            assert left.is_contiguous() and right.is_contiguous()
+            torch.testing.assert_close(left, expected[..., :split], atol=0, rtol=0)
+            torch.testing.assert_close(right, expected[..., split:], atol=0, rtol=0)
+    finally:
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize(
     "mixer_size,disable_nvls,layout",
     [

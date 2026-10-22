@@ -204,6 +204,22 @@ class ResidualConnection(nn.Module, ABC):
         )
         return state[0]
 
+    def prepare_write_state(
+        self, hidden_states: Tensor, *, fp32_residual_connection: bool = False
+    ) -> ResidualConnectionState:
+        """Recover write state when the caller already computed the branch update.
+
+        Connections whose write state is independent of their read can override this
+        to avoid materializing an unused branch input. Stateful connections retain
+        their ordinary read semantics through this default implementation.
+        """
+        _, state = self._read_with_validation(
+            hidden_states,
+            fp32_residual_connection=fp32_residual_connection,
+            branch_input_dtype=None,
+        )
+        return state
+
     @staticmethod
     def _validate_tensor_state(
         state: tuple[Tensor, ...], *, state_name: str, allow_empty: bool

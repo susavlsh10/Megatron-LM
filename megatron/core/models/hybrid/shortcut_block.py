@@ -26,6 +26,9 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
@@ -250,6 +253,9 @@ class ShortcutMoEBlock(MegatronModule):
             if self.config.moe_shortcut_post_norm
             else IdentityOp()
         )
+        self._inference_shortcut_read_norm = None
+        if self.shortcut_residual_read is not None and getattr(moe_layer, "_fused_mlp_norm", False):
+            self._inference_shortcut_read_norm = outer_connection._inference_read_rmsnorm
         self.route_ready_event = (
             torch.cuda.Event() if self.overlap_mode or self.inference_overlap else None
         )
@@ -309,6 +315,42 @@ class ShortcutMoEBlock(MegatronModule):
         if recompute_context is not None and self.config.fine_grained_activation_offloading:
             # Replay reconstructs this norm output; exclude it from saved-tensor offloading.
             self.off_interface.mark_not_offload(shortcut_input)
+        return self._moe_route_and_preprocess(shortcut_input, padding_mask, packed_seq_params)
+
+    def _moe_router_preprocess_inference(
+        self, hidden_states, padding_mask=None, packed_seq_params=None
+    ):
+        """Fuse the shortcut residual read and its norm before inference routing."""
+        if (
+            self._inference_shortcut_read_norm is not None
+            and InferenceMode.is_active()
+            and not self.training
+            and not torch.is_grad_enabled()
+            and not is_batch_invariant_mode_enabled()
+            and hidden_states.is_cuda
+            and hidden_states.is_contiguous()
+            and hidden_states.numel() // hidden_states.shape[-1] <= 64
+            and self.config.hidden_size <= 8192
+        ):
+            read = self.shortcut_residual_read
+            norm = self.shortcut_pre_mlp_layernorm
+            shortcut_input = self._inference_shortcut_read_norm(
+                hidden_states,
+                read.read_map(return_logits=True),
+                norm.weight,
+                read.num_streams,
+                norm.eps,
+                norm.zero_centered_gamma,
+            )
+            return self._moe_route_and_preprocess(shortcut_input, padding_mask, packed_seq_params)
+        return self._moe_router_preprocess(
+            self._read_shortcut_hidden(hidden_states, recompute_context=None),
+            padding_mask,
+            packed_seq_params,
+        )
+
+    def _moe_route_and_preprocess(self, shortcut_input, padding_mask, packed_seq_params):
+        """Route either an ordinary or fused normalized shortcut input."""
         shortcut_input, padding_mask, _, _ = self.moe_layer._maybe_unflatten_for_moe(
             shortcut_input, padding_mask, input_ids=None, packed_seq_params=packed_seq_params
         )

@@ -616,6 +616,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="bincount / scatter_add_ / index_add_ on integer counts: exact regardless of order.",
     ),
     KernelEntry(
+        name="streamwise_inference_fusions",
+        sources=(
+            "megatron/core/ops/residual/streamwise.py",
+            "megatron/core/transformer/wide_residual_layer.py",
+            "megatron/core/models/hybrid/shortcut_block.py",
+        ),
+        tests=(K + "test_streamwise_inference_fusions.py",),
+        kind="triton",
+        training_path=False,
+        notes="Strided FP32 joins preserve BF16 rounding; read-norm parity and bit-exact replay.",
+    ),
+    KernelEntry(
         name="inference_nemo_parallel_layouts",
         sources=(
             "megatron/core/inference/nemo_parallel.py",

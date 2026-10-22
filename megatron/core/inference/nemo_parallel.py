@@ -177,12 +177,15 @@ class NemoParallel:
         start = self.branch.tp.rank() * count
         return gathered.narrow(0, start, count).contiguous()
 
-    def join(self, update, residual, residual_width, config, branch_output=False):
+    def join(
+        self, update, residual, residual_width, config, branch_output=False, model_output=False
+    ):
         """Join branches into the requested replicated or sequence-sharded layout.
 
         Every token has one shared contribution, one routed contribution, and
         exactly one residual owner. FP32 transport preserves residual precision;
         the branch sum is rounded back to the model dtype before normalization.
+        ``model_output=True`` lets all-reduce emit contiguous model-dtype views.
         """
         local_tokens = update.shape[0]
         tokens = local_tokens * (1 if self.mode == "replicated" else self.branch.tp.size())
@@ -208,17 +211,27 @@ class NemoParallel:
             if residual is not None:
                 target[..., :residual_width].copy_(residual)
             target[..., residual_width:].copy_(update)
+        output_kwargs = {}
+        if model_output and not config.fp32_residual_connection:
+            output_kwargs = {"output_split": residual_width, "output_dtype": update.dtype}
         if branch_output:
             joined = self.join_reduce(
-                payload, buffer=buffer, output_start=start, output_tokens=local_tokens
+                payload,
+                buffer=buffer,
+                output_start=start,
+                output_tokens=local_tokens,
+                **output_kwargs,
             )
         elif self.mode == "replicated":
-            joined = self.join_reduce(payload, buffer=buffer)
+            joined = self.join_reduce(payload, buffer=buffer, **output_kwargs)
         elif use_nvls:
             joined = torch.empty(output_shape, dtype=torch.float32, device=update.device)
             multimem_reduce_scatter(joined, payload, buffer["handle"])
         else:
             joined = reduce_scatter_to_sequence_parallel_region(payload, group=self.full.tp)
+        if isinstance(joined, tuple):
+            residual, merged = joined
+            return merged, residual
         return joined[..., residual_width:].to(update.dtype), joined[..., :residual_width]
 
 
@@ -259,9 +272,8 @@ def forward_shortcut_pair(
             )
         update = shared
     else:
-        routed = block._read_shortcut_hidden(hidden, recompute_context=None)
-        inputs, probs = block._moe_router_preprocess(
-            routed, padding_mask=padding_mask, packed_seq_params=packed_seq_params
+        inputs, probs = block._moe_router_preprocess_inference(
+            hidden, padding_mask=padding_mask, packed_seq_params=packed_seq_params
         )
         inputs, probs = block._launch_dispatch(inputs, probs)
         update, _ = block.moe_layer.mlp.routed_experts_compute(inputs, probs)
@@ -274,9 +286,15 @@ def forward_shortcut_pair(
         residual_width,
         block.config,
         branch_output=getattr(block, "nemo_output_branch", False),
+        model_output=True,
     )
+    connection = block.moe_layer._get_mlp_residual_connection()
     residual = residual.to(torch.float32 if block.config.fp32_residual_connection else hidden.dtype)
-    # Residual connection state is architecture-owned. Reuse its read contract rather
-    # than assuming a particular wide-residual or ordinary residual representation.
-    _, residual, state = block.moe_layer._pre_mlp_layernorm_and_residual(residual)
+    if connection is None:
+        state = ()
+    else:
+        state = connection.prepare_write_state(
+            residual, fp32_residual_connection=block.config.fp32_residual_connection
+        )
+        residual = connection.residual_stream(state)
     return block._postprocess_merged(update, residual, state, packed_seq_params=packed_seq_params)
