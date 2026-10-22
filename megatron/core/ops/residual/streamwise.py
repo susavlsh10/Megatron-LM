@@ -86,6 +86,41 @@ def _tuned_inverse_rms(chunks, HIDDEN: tl.constexpr, THREADS: tl.constexpr, EPS:
 
 
 @triton.jit
+def _normalize_read_chunks(
+    chunks,
+    partial,
+    WEIGHT,
+    OUT,
+    row,
+    H: tl.constexpr,
+    EPS: tl.constexpr,
+    ZERO_CENTERED: tl.constexpr,
+    THREADS: tl.constexpr,
+    ELEMENTS: tl.constexpr,
+    TUNED: tl.constexpr,
+):
+    CHUNKS: tl.constexpr = tl.cdiv(H, THREADS * ELEMENTS)
+    columns = tl.arange(0, THREADS)[:, None] * ELEMENTS + tl.arange(0, ELEMENTS)[None, :]
+    if TUNED:
+        inverse_rms = _tuned_inverse_rms(chunks, H, THREADS, EPS)
+    else:
+        if THREADS == 128:
+            warp_totals = tl.sum(tl.reshape(partial, (4, 32)), 1)
+            total = tl.full((), 0, tl.float32)
+            for warp in tl.static_range(4):
+                total += tl.sum(tl.where(tl.arange(0, 4) == warp, warp_totals, 0), 0)
+        else:
+            total = tl.sum(_warp_leaders(_warp_allreduce(partial, THREADS), THREADS), 0)
+        inverse_rms = tl.rsqrt(tl.fma(total, 1.0 / H, EPS))
+    for chunk in tl.static_range(CHUNKS):
+        h = columns + chunk * THREADS * ELEMENTS
+        weight = tl.load(WEIGHT + h, h < H, 0).to(tl.float32)
+        if ZERO_CENTERED:
+            weight += 1.0
+        tl.store(OUT + row * H + h, (chunks[chunk] * inverse_rms) * weight, h < H)
+
+
+@triton.jit
 def _streamwise_read_rmsnorm_kernel(
     X,
     LOGITS,
@@ -112,30 +147,133 @@ def _streamwise_read_rmsnorm_kernel(
             x = tl.load(X + row * STRIDE + k * H + h, h < H, 0).to(tl.float32)
             factor = tl.sigmoid(tl.load(LOGITS + k).to(tl.float32))
             value = tl.fma(factor, x, value)
-        # Preserve the materialized read's BF16 rounding before norm statistics.
         value = value.to(tl.bfloat16).to(tl.float32)
         chunks += (value,)
         if not TUNED:
             values = _vector_elements(value, THREADS, ELEMENTS)
             for element in tl.static_range(ELEMENTS):
                 partial = tl.fma(values[element], values[element], partial)
-    if TUNED:
-        inverse_rms = _tuned_inverse_rms(chunks, H, THREADS, EPS)
-    else:
-        if THREADS == 128:
-            warp_totals = tl.sum(tl.reshape(partial, (4, 32)), 1)
-            total = tl.full((), 0, tl.float32)
-            for warp in tl.static_range(4):
-                total += tl.sum(tl.where(tl.arange(0, 4) == warp, warp_totals, 0), 0)
-        else:
-            total = tl.sum(_warp_leaders(_warp_allreduce(partial, THREADS), THREADS), 0)
-        inverse_rms = tl.rsqrt(tl.fma(total, 1.0 / H, EPS))
+    _normalize_read_chunks(
+        chunks, partial, WEIGHT, OUT, row, H, EPS, ZERO_CENTERED, THREADS, ELEMENTS, TUNED
+    )
+
+
+@triton.jit
+def _streamwise_write_read_rmsnorm_kernel(
+    X,
+    UPDATE,
+    WRITE_LOGITS,
+    RETENTION_LOGITS,
+    READ_LOGITS,
+    WEIGHT,
+    RESIDUAL_OUT,
+    OUT,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    HAS_RETENTION: tl.constexpr,
+    MAX_FORGET: tl.constexpr,
+    EPS: tl.constexpr,
+    ZERO_CENTERED: tl.constexpr,
+    THREADS: tl.constexpr,
+    ELEMENTS: tl.constexpr,
+    TUNED: tl.constexpr,
+):
+    row = tl.program_id(0)
+    CHUNKS: tl.constexpr = tl.cdiv(H, THREADS * ELEMENTS)
+    columns = tl.arange(0, THREADS)[:, None] * ELEMENTS + tl.arange(0, ELEMENTS)[None, :]
+    partial = tl.full((THREADS,), 0, tl.float32)
+    chunks = ()
     for chunk in tl.static_range(CHUNKS):
         h = columns + chunk * THREADS * ELEMENTS
-        weight = tl.load(WEIGHT + h, h < H, 0).to(tl.float32)
-        if ZERO_CENTERED:
-            weight += 1.0
-        tl.store(OUT + row * H + h, (chunks[chunk] * inverse_rms) * weight, h < H)
+        update = tl.load(UPDATE + row * H + h, h < H, 0).to(tl.float32)
+        value = tl.full((THREADS, ELEMENTS), 0, tl.float32)
+        for k in tl.static_range(K):
+            offset = row * K * H + k * H + h
+            residual = tl.load(X + offset, h < H, 0).to(tl.float32)
+            write = 2.0 * tl.sigmoid(tl.load(WRITE_LOGITS + k).to(tl.float32))
+            if HAS_RETENTION:
+                forget = tl.sigmoid(-tl.load(RETENTION_LOGITS + k).to(tl.float32))
+                retention = tl.fma(-MAX_FORGET, forget, 1.0)
+                carried = retention * residual
+            else:
+                carried = residual
+            updated = tl.fma(write, update, carried).to(X.dtype.element_ty)
+            # Both the carried residual and next read observe the original write's
+            # storage rounding. Keep that boundary even though the read uses registers.
+            tl.store(RESIDUAL_OUT + offset, updated, h < H)
+            read = tl.sigmoid(tl.load(READ_LOGITS + k).to(tl.float32))
+            value = tl.fma(read, updated.to(tl.float32), value)
+        value = value.to(tl.bfloat16).to(tl.float32)
+        chunks += (value,)
+        if not TUNED:
+            values = _vector_elements(value, THREADS, ELEMENTS)
+            for element in tl.static_range(ELEMENTS):
+                partial = tl.fma(values[element], values[element], partial)
+    _normalize_read_chunks(
+        chunks, partial, WEIGHT, OUT, row, H, EPS, ZERO_CENTERED, THREADS, ELEMENTS, TUNED
+    )
+
+
+def streamwise_write_read_rmsnorm(
+    residual,
+    update,
+    write_logits,
+    read_logits,
+    weight,
+    num_streams,
+    eps,
+    retention_logits=None,
+    retention_max_forget=0.0,
+    zero_centered=False,
+):
+    """Write carried streams and normalize their next read in one inference kernel.
+
+    The caller supplies the producer's write parameters and consumer's read/norm
+    parameters. Neither input is modified; the updated carry remains materialized.
+    """
+    tensors = (residual, update, write_logits, read_logits, weight)
+    if retention_logits is not None:
+        tensors += (retention_logits,)
+    if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
+        raise RuntimeError("Streamwise write/read RMSNorm is inference-only.")
+    assert residual.is_cuda
+    assert all(t.device == residual.device and t.is_contiguous() for t in tensors)
+    assert residual.dtype == update.dtype == torch.bfloat16
+    assert num_streams > 0
+    width = residual.shape[-1] // num_streams
+    assert residual.shape[-1] == num_streams * width
+    assert update.shape == (*residual.shape[:-1], width)
+    assert weight.numel() == width
+    assert write_logits.numel() >= num_streams and read_logits.numel() >= num_streams
+    assert retention_logits is None or retention_logits.numel() >= num_streams
+    carried = torch.empty_like(residual)
+    out = torch.empty_like(update)
+    rows = residual.numel() // residual.shape[-1]
+    if rows:
+        _streamwise_write_read_rmsnorm_kernel[(rows,)](
+            residual,
+            update,
+            write_logits,
+            retention_logits,
+            read_logits,
+            weight,
+            carried,
+            out,
+            width,
+            num_streams,
+            retention_logits is not None,
+            retention_max_forget,
+            eps,
+            zero_centered,
+            32 if width <= 2048 else 128,
+            4 if width <= 128 else 8,
+            width in (512, 768, 1024, 2048, 4096, 8192)
+            and rows % 4 == 0
+            and weight.data_ptr() % 16 == 0,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return carried, out
 
 
 def streamwise_read_rmsnorm(x, logits, weight, num_streams, eps, zero_centered=False):

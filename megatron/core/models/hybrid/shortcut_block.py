@@ -365,13 +365,22 @@ class ShortcutMoEBlock(MegatronModule):
         padding_mask=None,
         packed_seq_params=None,
         recompute_context: ResidualStreamRecomputeContext | None = None,
+        normalized_input=None,
     ):
         """Run the paired MoE layer's pre-MLP norm and shared experts.
 
         Returns:
             `(shared_expert_output, moe_unflatten_mbs, residual, mlp_state)`.
         """
-        if recompute_context is None:
+        if normalized_input is not None:
+            assert recompute_context is None
+            pre_mlp_output = normalized_input
+            connection = self.moe_layer._get_mlp_residual_connection()
+            mlp_state = connection.prepare_write_state(
+                hidden_states, fp32_residual_connection=self.config.fp32_residual_connection
+            )
+            residual = connection.residual_stream(mlp_state)
+        elif recompute_context is None:
             pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
                 hidden_states
             )

@@ -627,7 +627,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_streamwise_inference_fusions.py",),
         kind="triton",
         training_path=False,
-        notes="Strided FP32 joins preserve BF16 rounding; read-norm parity and bit-exact replay.",
+        notes="Read/norm and write/read/norm preserve BF16 boundaries; parity and exact replay.",
     ),
     KernelEntry(
         name="inference_nemo_parallel_layouts",
@@ -636,7 +636,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ops/communication/nvls_all_reduce.py",
             "megatron/core/inference/communication/all_reduce.py",
         ),
-        tests=(K + "test_nemo_parallel.py",),
+        tests=(K + "test_nemo_parallel.py", K + "test_streamwise_inference_fusions.py"),
         kind="triton",
         training_path=False,
         notes="Distributed layout and BF16/FP32 collective replay covers token ordering, "

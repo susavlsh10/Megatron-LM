@@ -12,14 +12,20 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
-from megatron.core.ops.residual.streamwise import streamwise_read_rmsnorm
+from megatron.core.ops.residual.streamwise import (
+    streamwise_read_rmsnorm,
+    streamwise_write_read_rmsnorm,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.inference_layers import InferenceLayerNormColumnParallelLinear
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.residual_connection import ResidualConnection
-from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_read
+from megatron.core.transformer.streamwise_residual_ops import (
+    streamwise_sigmoid_read,
+    streamwise_sigmoid_writeback,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
@@ -29,6 +35,153 @@ from megatron.core.transformer.wide_residual_layer import (
 )
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize("rows", [1, 32, 64])
+@pytest.mark.parametrize("retention", [False, True])
+def test_write_read_rmsnorm_reference_and_graph_replay(rows, retention):
+    """Compare both outputs to the existing write followed by read/norm."""
+    seeded()
+    width, streams = 3072, 3
+    residual = torch.randn(rows, 1, width * streams, device="cuda", dtype=torch.bfloat16)
+    update = torch.randn(rows, 1, width, device="cuda", dtype=torch.bfloat16)
+    write = torch.randn(streams, device="cuda")
+    read = torch.randn(streams, device="cuda")
+    retain = torch.randn(streams, device="cuda") if retention else None
+    norm = te.RMSNorm(width, eps=1e-5, params_dtype=torch.bfloat16, device="cuda").eval()
+
+    def fused(residual, update, write, read, weight):
+        return streamwise_write_read_rmsnorm(
+            residual,
+            update,
+            write,
+            read,
+            weight,
+            streams,
+            1e-5,
+            retention_logits=retain,
+            retention_max_forget=0.1,
+        )
+
+    previous = InferenceMode.is_active()
+    InferenceMode.set_active()
+    try:
+        with torch.no_grad():
+            norm.weight.normal_()
+            assert_replays_bit_exact(
+                fused,
+                (residual, update, write, read, norm.weight.detach()),
+                replays=2,
+                contention=True,
+            )
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    fused(residual, update, write, read, norm.weight)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                carried, normalized = fused(residual, update, write, read, norm.weight)
+            for _ in range(2):
+                residual.normal_()
+                update.normal_()
+                graph.replay()
+                expected = streamwise_sigmoid_writeback(
+                    residual,
+                    update,
+                    write,
+                    streams,
+                    retention_logits=retain,
+                    retention_max_forget=0.1,
+                )
+                expected_norm = norm(
+                    streamwise_sigmoid_read(expected, read, streams, output_dtype=torch.bfloat16)
+                )
+                # The original tiled write mixes contracted and uncontracted FP32
+                # arithmetic after compilation. The fusion uses explicit FMAs;
+                # preserve BF16 boundaries and compare at BF16 precision instead
+                # of depending on that compiler/layout-specific contraction.
+                torch.testing.assert_close(carried, expected, atol=2e-5, rtol=8e-3)
+                torch.testing.assert_close(normalized, expected_norm, atol=2e-3, rtol=8e-3)
+                print(
+                    "WRITE_READ_PARITY",
+                    rows,
+                    retention,
+                    "carry_mismatches",
+                    (carried != expected).sum().item(),
+                    "carry_max_abs",
+                    (carried.float() - expected.float()).abs().max().item(),
+                    "norm_mismatches",
+                    (normalized != expected_norm).sum().item(),
+                    "norm_max_abs",
+                    (normalized.float() - expected_norm.float()).abs().max().item(),
+                )
+    finally:
+        if not previous:
+            InferenceMode.unset_active()
+
+
+def test_write_read_mixer_consumer_adapter():
+    class AtomicMixer(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def forward(self, x, **kwargs):
+            return x * 0.25, None
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=3072,
+        num_attention_heads=2,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        normalization="RMSNorm",
+        transformer_impl="inference_optimized",
+        add_bias_linear=False,
+        hidden_dropout=0.0,
+        wide_residual=WideResidualConfig(num_streams=3, learned_retention=True),
+    )
+    layer = (
+        WideResidualMambaLayer(
+            config,
+            MambaLayerSubmodules(norm=TENorm, mixer=AtomicMixer, mamba_bda=get_bias_dropout_add),
+            pg_collection=ProcessGroupCollection(),
+        )
+        .cuda()
+        .eval()
+    )
+    consumer = (
+        StreamwiseSigmoidWideResidualConnection(config, 2, "test", ProcessGroupCollection())
+        .cuda()
+        .eval()
+    )
+    norm = te.RMSNorm(3072, eps=1e-5, params_dtype=torch.bfloat16, device="cuda").eval()
+    hidden = torch.randn(32, 1, 9216, device="cuda", dtype=torch.bfloat16)
+    context = SimpleNamespace(is_decode_only=lambda: True)
+    previous = InferenceMode.is_active()
+    InferenceMode.set_active()
+    try:
+        with torch.no_grad():
+            branch, residual, state, _ = layer._prepare_mixer_state(hidden)
+            expected = layer._apply_mixer_update(layer.mixer(branch), residual, state)
+            read, _ = consumer(expected, operation="read", branch_input_dtype=torch.bfloat16)
+            carried, normalized = layer.forward_with_write_read_norm(
+                hidden, consumer, norm, context
+            )
+            torch.testing.assert_close(carried, expected, atol=2e-5, rtol=8e-3)
+            torch.testing.assert_close(normalized, norm(read), atol=2e-3, rtol=8e-3)
+            assert (
+                layer.forward_with_write_read_norm(
+                    hidden, consumer, norm, SimpleNamespace(is_decode_only=lambda: False)
+                )
+                is None
+            )
+            layer.train()
+            assert layer.forward_with_write_read_norm(hidden, consumer, norm, context) is None
+    finally:
+        if not previous:
+            InferenceMode.unset_active()
 
 
 @pytest.mark.parametrize(

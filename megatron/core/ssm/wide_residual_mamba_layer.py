@@ -7,6 +7,9 @@ from torch import Tensor
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.residual_connection import ResidualConnectionState
 from megatron.core.transformer.residual_recompute import (
@@ -89,6 +92,57 @@ class WideResidualMambaLayer(MambaLayer):
         """Return the connection surrounding the Mamba mixer."""
 
         return self.residual_connection
+
+    def forward_with_write_read_norm(
+        self, hidden_states, next_connection, next_norm, inference_context, packed_seq_params=None
+    ):
+        """Optionally fuse this mixer's write with its immediate consumer's read/norm.
+
+        Return ``None`` before computing anything when unsupported. Keep the atomic,
+        cache-aware mixer forward and return both tensors explicitly to the caller.
+        """
+        connection = self.residual_connection
+        if (
+            connection._inference_write_read_rmsnorm is None
+            or type(next_connection) is not StreamwiseSigmoidWideResidualConnection
+            or self.training
+            or torch.is_grad_enabled()
+            or not InferenceMode.is_active()
+            or is_batch_invariant_mode_enabled()
+            or not inference_context.is_decode_only()
+            or self.config.fp32_residual_connection
+            or hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_cuda
+            or not hidden_states.is_contiguous()
+            or hidden_states.numel() // hidden_states.shape[-1] > 64
+            or self.config.hidden_size > 8192
+            or next_connection.num_streams != connection.num_streams
+        ):
+            return None
+        normalized, residual, state, _ = self._prepare_mixer_state(hidden_states)
+        result = self.mixer(
+            normalized, inference_context=inference_context, packed_seq_params=packed_seq_params
+        )
+        update, bias = result if isinstance(result, tuple) else (result, None)
+        if bias is not None:
+            carried = self._apply_mixer_update(result, residual, state)
+            branch, _ = next_connection(
+                carried, operation="read", branch_input_dtype=self.config.params_dtype
+            )
+            return carried, next_norm(branch)
+        retention = connection.retention
+        return connection._inference_write_read_rmsnorm(
+            residual,
+            update,
+            connection.write_map(return_logits=True),
+            next_connection.read_map(return_logits=True),
+            next_norm.weight,
+            connection.num_streams,
+            next_norm.eps,
+            retention_logits=retention(return_logits=True) if retention is not None else None,
+            retention_max_forget=retention.max_forget if retention is not None else 0.0,
+            zero_centered=next_norm.zero_centered_gamma,
+        )
 
     def _prepare_mixer_state(
         self,

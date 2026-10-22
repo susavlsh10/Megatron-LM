@@ -224,6 +224,7 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             else None
         )
         self._inference_read_rmsnorm = None
+        self._inference_write_read_rmsnorm = None
         if (
             config.transformer_impl == "inference_optimized"
             and config.params_dtype == torch.bfloat16
@@ -245,6 +246,7 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
                 needed_by="Streamwise residual inference fusion",
             )
             self._inference_read_rmsnorm = kernels.streamwise_read_rmsnorm
+            self._inference_write_read_rmsnorm = kernels.streamwise_write_read_rmsnorm
 
     def bind_projection_input_norm(self, projection) -> bool:
         """Externalize a supported projection's norm without moving checkpoint parameters."""
