@@ -621,6 +621,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ops/residual/streamwise.py",
             "megatron/core/transformer/wide_residual_layer.py",
             "megatron/core/models/hybrid/shortcut_block.py",
+            "megatron/core/ssm/wide_residual_mamba_layer.py",
+            "megatron/core/tensor_parallel/inference_layers.py",
         ),
         tests=(K + "test_streamwise_inference_fusions.py",),
         kind="triton",

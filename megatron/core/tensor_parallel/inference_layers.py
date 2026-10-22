@@ -20,6 +20,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.tensor_parallel.mappings import (
@@ -191,6 +192,20 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         # in tensor parallelism. In this case, the preceeding RowParallelLinear layer
         # has already applied the rms-norm and all-gather.
         self.skip_norm_and_all_gather = False
+        self._input_norm_external = False
+
+    def set_input_norm_external(self) -> None:
+        """Let the owning layer normalize inference inputs, retaining this module's weights.
+
+        The owner must supply normalized inputs for every inference phase. Training
+        and evaluation outside InferenceMode retain the ordinary normalization path.
+        Sequence-parallel gathering remains owned by this projection.
+        """
+        self._input_norm_external = True
+
+    def normalize_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply this projection's existing input norm without moving its parameters."""
+        return _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
 
     def set_barrier_before_all_gather(self, value: bool = True) -> None:
         """Request a barrier before this layer's input all-gather reuses the buffer.
@@ -255,7 +270,12 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             return super().forward(x)
 
         if self.tp_size == 1 or not self.sequence_parallel:
-            x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
+            if not (
+                self._input_norm_external
+                and InferenceMode.is_active()
+                and not torch.is_grad_enabled()
+            ):
+                x = self.normalize_input(x)
             x = _apply_linear(x, self.weight, self.config)
             return x, None
 
@@ -268,7 +288,12 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if is_in_fused_mode:
             x = symm_mem_buffer["tensor"]
         else:
-            x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
+            if not (
+                self._input_norm_external
+                and InferenceMode.is_active()
+                and not torch.is_grad_enabled()
+            ):
+                x = self.normalize_input(x)
             x = self._all_gather(x, symm_mem_buffer)
 
         x = _apply_linear(x, self.weight, self.config)

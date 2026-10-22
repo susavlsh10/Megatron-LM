@@ -1,8 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Mamba layer specialization for streamwise wide-residual connections."""
 
+import torch
 from torch import Tensor
 
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.identity_op import IdentityOp
@@ -65,6 +67,11 @@ class WideResidualMambaLayer(MambaLayer):
         self.residual_stream_hidden_size = (
             config.wide_residual.num_streams * self.config.hidden_size
         )
+        self._inference_projection_norm = isinstance(
+            self.norm, IdentityOp
+        ) and self.residual_connection.bind_projection_input_norm(
+            getattr(self.mixer, "in_proj", None)
+        )
         if self.residual_connection.residual_stream_hidden_size != self.residual_stream_hidden_size:
             raise ValueError(
                 "The wide-residual Mamba connection must carry num_streams * hidden_size "
@@ -90,6 +97,19 @@ class WideResidualMambaLayer(MambaLayer):
     ) -> tuple[Tensor, Tensor, ResidualConnectionState, ResidualStreamRecomputeContext | None]:
         """Read the wide stream and optionally replay its connected input normalization."""
 
+        if (
+            self._inference_projection_norm
+            and InferenceMode.is_active()
+            and not self.training
+            and not torch.is_grad_enabled()
+            and residual_stream_recompute_context is None
+        ):
+            output, residual, state = self.residual_connection.read_projection_norm(
+                hidden_states,
+                self.mixer.in_proj,
+                fp32_residual_connection=self.config.fp32_residual_connection,
+            )
+            return output, residual, state, None
         recompute_context = residual_stream_recompute_context
         if recompute_context is None:
             hidden_states, connection_state = apply_module(self.residual_connection)(

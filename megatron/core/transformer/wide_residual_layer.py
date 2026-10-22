@@ -230,6 +230,14 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             and not config.fp8
             and not config.fp4
             and not config.deterministic_mode
+            and not any(
+                os.environ.get(name, "0") != "0"
+                for name in (
+                    "NVTE_NORM_FWD_USE_CUDNN",
+                    "NVTE_NORM_USE_CUDNN",
+                    "NVTE_USE_CUDNN_RMSNORM",
+                )
+            )
         ):
             kernels = require(
                 "megatron.core.ops.residual.streamwise",
@@ -237,6 +245,52 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
                 needed_by="Streamwise residual inference fusion",
             )
             self._inference_read_rmsnorm = kernels.streamwise_read_rmsnorm
+
+    def bind_projection_input_norm(self, projection) -> bool:
+        """Externalize a supported projection's norm without moving checkpoint parameters."""
+        if self._inference_read_rmsnorm is None:
+            return False
+        projection_type = require(
+            "megatron.core.tensor_parallel.inference_layers",
+            "InferenceLayerNormColumnParallelLinear",
+            needed_by="Streamwise projection input normalization",
+        ).InferenceLayerNormColumnParallelLinear
+        if type(projection) is not projection_type:
+            return False
+        projection.set_input_norm_external()
+        return True
+
+    def read_projection_norm(self, hidden_states, projection, *, fp32_residual_connection):
+        """Read and normalize once, retaining the projection's norm and gather contracts."""
+        fused = (
+            self._inference_read_rmsnorm is not None
+            and not torch.is_grad_enabled()
+            and not is_batch_invariant_mode_enabled()
+            and hidden_states.is_cuda
+            and hidden_states.is_contiguous()
+            and hidden_states.numel() // hidden_states.shape[-1] <= 64
+            and projection.layer_norm_weight.numel() <= 8192
+        )
+        if fused:
+            output = self._inference_read_rmsnorm(
+                hidden_states,
+                self.read_map(return_logits=True),
+                projection.layer_norm_weight,
+                self.num_streams,
+                projection.eps,
+            )
+            state = self.prepare_write_state(
+                hidden_states, fp32_residual_connection=fp32_residual_connection
+            )
+        else:
+            branch, state = self(
+                hidden_states,
+                operation="read",
+                fp32_residual_connection=fp32_residual_connection,
+                branch_input_dtype=projection.config.params_dtype,
+            )
+            output = projection.normalize_input(branch)
+        return output, self.residual_stream(state), state
 
     def prepare_write_state(
         self, hidden_states: Tensor, *, fp32_residual_connection: bool = False
@@ -408,6 +462,7 @@ class WideResidualTransformerLayer(TransformerLayer):
             config.wide_residual.num_streams * self.config.hidden_size
         )
         self._fused_input_norm = self._fused_mlp_norm = False
+        self._inference_projection_norm = False
         if any(
             connection._inference_read_rmsnorm is not None for connection in residual_connections
         ) and not any(
@@ -420,6 +475,12 @@ class WideResidualTransformerLayer(TransformerLayer):
             # Custom norm classes retain their forward methods and output contracts.
             self._fused_input_norm = type(self.input_layernorm) is norm_type
             self._fused_mlp_norm = type(self.pre_mlp_layernorm) is norm_type
+            if isinstance(self.input_layernorm, IdentityOp) and self.residual_connection_self_attn:
+                self._inference_projection_norm = (
+                    self.residual_connection_self_attn.bind_projection_input_norm(
+                        getattr(self.self_attention, "in_proj", None)
+                    )
+                )
         for connection in residual_connections:
             if connection.residual_stream_hidden_size != self.residual_stream_hidden_size:
                 raise ValueError(
@@ -465,6 +526,22 @@ class WideResidualTransformerLayer(TransformerLayer):
     def _run_input_layernorm(
         self, hidden_states, mhc_recompute_manager=None, residual_stream_recompute_context=None
     ):
+        if (
+            self._inference_projection_norm
+            and InferenceMode.is_active()
+            and not self.training
+            and not torch.is_grad_enabled()
+            and mhc_recompute_manager is None
+            and residual_stream_recompute_context is None
+        ):
+            result = self.residual_connection_self_attn.read_projection_norm(
+                hidden_states,
+                self.self_attention.in_proj,
+                fp32_residual_connection=self.config.fp32_residual_connection,
+            )
+            self.attn_norm_manager = self.off_interface(False, hidden_states, "attn_norm")
+            self._input_layernorm_checkpoint_active = False
+            return result
         if (
             self._fused_input_norm
             and mhc_recompute_manager is None
