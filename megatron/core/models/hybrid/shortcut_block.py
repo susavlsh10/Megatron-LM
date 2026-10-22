@@ -537,6 +537,25 @@ class ShortcutMoEBlock(MegatronModule):
         )
         return hidden_states
 
+    def _forward_compute_with_shared_norm(self, hidden_states, **kwargs):
+        """Reuse a producer's write for the following shared-expert read/norm."""
+        forward_fused = getattr(self.compute_layer, "forward_with_write_read_norm", None)
+        if (
+            kwargs["inference_context"] is not None
+            and callable(forward_fused)
+            and getattr(self.moe_layer, "_fused_mlp_norm", False)
+        ):
+            fused = forward_fused(
+                hidden_states,
+                self.moe_layer._get_mlp_residual_connection(),
+                self.moe_layer.pre_mlp_layernorm,
+                kwargs["inference_context"],
+                kwargs["packed_seq_params"],
+            )
+            if fused is not None:
+                return fused
+        return self._forward_compute_atomic(hidden_states, **kwargs), None
+
     def _forward_inference_overlap(
         self,
         hidden_states,
@@ -779,10 +798,11 @@ class ShortcutMoEBlock(MegatronModule):
             if overlap:
                 self.route_ready_event.record(torch.cuda.current_stream())
 
+        normalized_shared = None
         # Launch the input and attn of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
             if inference:
-                attn_layer_output = self._forward_compute_atomic(
+                attn_layer_output, normalized_shared = self._forward_compute_with_shared_norm(
                     hidden_states,
                     attention_mask=attention_mask,
                     inference_context=inference_context,
@@ -854,6 +874,7 @@ class ShortcutMoEBlock(MegatronModule):
                     padding_mask=padding_mask,
                     packed_seq_params=moe_packed_seq_params,
                     recompute_context=moe_recompute_context,
+                    normalized_input=normalized_shared,
                 )
             )
             if overlap:

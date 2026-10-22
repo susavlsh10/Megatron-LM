@@ -171,6 +171,38 @@ def test_write_read_mixer_consumer_adapter():
             )
             torch.testing.assert_close(carried, expected, atol=2e-5, rtol=8e-3)
             torch.testing.assert_close(normalized, norm(read), atol=2e-3, rtol=8e-3)
+            atomic_calls = []
+
+            def atomic(hidden, **kwargs):
+                atomic_calls.append(1)
+                return expected
+
+            block = SimpleNamespace(
+                compute_layer=layer,
+                moe_layer=SimpleNamespace(
+                    _fused_mlp_norm=True,
+                    _get_mlp_residual_connection=lambda: consumer,
+                    pre_mlp_layernorm=norm,
+                ),
+                _forward_compute_atomic=atomic,
+            )
+            kwargs = dict(inference_context=context, packed_seq_params=None)
+            carried, normalized = ShortcutMoEBlock._forward_compute_with_shared_norm(
+                block, hidden, **kwargs
+            )
+            torch.testing.assert_close(carried, expected, atol=2e-5, rtol=8e-3)
+            torch.testing.assert_close(normalized, norm(read), atol=2e-3, rtol=8e-3)
+            assert not atomic_calls
+            kwargs["inference_context"] = SimpleNamespace(is_decode_only=lambda: False)
+            carried, normalized = ShortcutMoEBlock._forward_compute_with_shared_norm(
+                block, hidden, **kwargs
+            )
+            assert carried is expected and normalized is None and len(atomic_calls) == 1
+            block.moe_layer._fused_mlp_norm = False
+            carried, normalized = ShortcutMoEBlock._forward_compute_with_shared_norm(
+                block, hidden, **kwargs
+            )
+            assert carried is expected and normalized is None and len(atomic_calls) == 2
             assert (
                 layer.forward_with_write_read_norm(
                     hidden, consumer, norm, SimpleNamespace(is_decode_only=lambda: False)

@@ -252,21 +252,17 @@ def forward_shortcut_pair(
     hidden = plan.fork(hidden, block.config, getattr(block, "nemo_input_branch", False))
     residual_width = hidden.shape[-1]
     if plan.is_mixer:
-        fused = None
-        forward_fused = getattr(block.compute_layer, "forward_with_write_read_norm", None)
-        if (
-            plan.mode == "replicated"
-            and callable(forward_fused)
-            and getattr(block.moe_layer, "_fused_mlp_norm", False)
-        ):
-            fused = forward_fused(
+        if plan.mode == "replicated":
+            computed, normalized_shared = block._forward_compute_with_shared_norm(
                 hidden,
-                block.moe_layer._get_mlp_residual_connection(),
-                block.moe_layer.pre_mlp_layernorm,
-                context,
-                packed_seq_params,
+                attention_mask=attention_mask,
+                inference_context=context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
             )
-        if fused is None:
+        else:
             computed = block._forward_compute_atomic(
                 hidden,
                 attention_mask=attention_mask,
@@ -277,8 +273,6 @@ def forward_shortcut_pair(
                 padding_mask=padding_mask,
             )
             normalized_shared = None
-        else:
-            computed, normalized_shared = fused
         shared, _, residual, _ = block._moe_shared_experts(
             computed,
             padding_mask=padding_mask,
